@@ -1071,11 +1071,7 @@ impl Context3D for WgpuContext3D {
 
                 // Wgpu requires us to pad the image rows to a multiple of COPY_BYTES_PER_ROW_ALIGNMENT
                 let dest_bytes_per_row =
-                    if matches!(dest.texture.format(), wgpu::TextureFormat::Rgba8Unorm) {
-                        (source_width * 4).next_multiple_of(COPY_BYTES_PER_ROW_ALIGNMENT)
-                    } else {
-                        src_bytes_per_row
-                    };
+                    src_bytes_per_row.next_multiple_of(COPY_BYTES_PER_ROW_ALIGNMENT);
                 let dest_size = dest_bytes_per_row as u64 * rows_per_image as u64;
                 assert!(
                     dest_bytes_per_row >= src_bytes_per_row && dest_size >= source.len() as u64
