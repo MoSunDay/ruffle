@@ -73,18 +73,9 @@ pub struct WgpuContext3D {
     vertex_attributes: [Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
 
     buffer_command_encoder: CommandEncoder,
-    // We may re-create `render_pass` multiple times while processing
-    // `commands`. If we do, then we only want to perform a clear if there
-    // was an explicit `Clear` command. Otherwise, we want to preserve the
-    // contents of the previous render pass.
-    //
-    // This variable gets set to `Some` when we encounter a `Clear` command,
-    // and then gets set to `None` when we create a new render pass.
-    clear_color: Option<ClearColor>,
     // After a call to 'present()', the Context3D API requires a call to 'clear'
     // before any new calls to 'drawTriangles'. This tracks whether we've
-    // seen a `Context3DCommand::Clear` so far. Note that this is separate from
-    // `clear_color`, which may be `None` even if we've seen a `Clear` command.
+    // seen a `Context3DCommand::Clear` so far.
     seen_clear_command: bool,
 
     scissor_rectangle: Option<Rectangle<Twips>>,
@@ -162,7 +153,6 @@ impl WgpuContext3D {
             front_buffer_resolve_texture_view: None,
 
             buffer_command_encoder,
-            clear_color: None,
             seen_clear_command: false,
             scissor_rectangle: None,
         }
@@ -204,28 +194,79 @@ impl WgpuContext3D {
             .update_target_format(TextureFormat::Rgba8Unorm);
     }
 
+    fn clear_current_target(&mut self, clear: ClearColor) {
+        let Some(color_view) = self.current_texture_view.as_ref() else {
+            // There is no configured render target to clear yet.
+            return;
+        };
+
+        let color_load = if clear.mask & COLOR_MASK != 0 {
+            wgpu::LoadOp::Clear(clear.rgb)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let depth_load = if clear.mask & DEPTH_MASK != 0 {
+            wgpu::LoadOp::Clear(clear.depth)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let stencil_load = if clear.mask & STENCIL_MASK != 0 {
+            wgpu::LoadOp::Clear(clear.stencil)
+        } else {
+            wgpu::LoadOp::Load
+        };
+
+        let depth_stencil_attachment = self.current_depth_texture_view.as_ref().map(|depth_view| {
+            wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: depth_load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: Some(wgpu::Operations {
+                    load: stencil_load,
+                    store: wgpu::StoreOp::Store,
+                }),
+            }
+        });
+
+        let mut command_encoder =
+            self.descriptors
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: create_debug_label!("Context3D clear command encoder").as_deref(),
+                });
+
+        {
+            let _pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Context3D clear render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: self.current_texture_resolve_view.as_ref(),
+                    ops: wgpu::Operations {
+                        load: color_load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment,
+                ..Default::default()
+            });
+        }
+
+        self.descriptors.queue.submit([command_encoder.finish()]);
+    }
+
     fn make_render_pass<'a>(
         &'a mut self,
         command_encoder: &'a mut CommandEncoder,
     ) -> RenderPass<'a> {
-        // Subsequent draw calls (without an intermediate 'clear()' call)
-        // will use a clear color of None. This ensures that by itself,
-        // re-creating the render pass has no effect on the output
-        let clear_color = self.clear_color.take();
-        let color_load = match clear_color {
-            Some(clear) if clear.mask & COLOR_MASK != 0 => wgpu::LoadOp::Clear(clear.rgb),
-            _ => wgpu::LoadOp::Load,
-        };
-
-        let depth_load = match clear_color {
-            Some(clear) if clear.mask & DEPTH_MASK != 0 => wgpu::LoadOp::Clear(clear.depth),
-            _ => wgpu::LoadOp::Load,
-        };
-
-        let stencil_load = match clear_color {
-            Some(clear) if clear.mask & STENCIL_MASK != 0 => wgpu::LoadOp::Clear(clear.stencil),
-            _ => wgpu::LoadOp::Load,
-        };
+        // Clears are handled immediately against the render target that was
+        // bound when `Context3DCommand::Clear` was processed. Re-creating the
+        // render pass must never consume a clear meant for another target.
+        let color_load = wgpu::LoadOp::Load;
+        let depth_load = wgpu::LoadOp::Load;
+        let stencil_load = wgpu::LoadOp::Load;
 
         let depth_stencil_attachment = if let Some(depth_view) = &self.current_depth_texture_view {
             Some(wgpu::RenderPassDepthStencilAttachment {
@@ -517,7 +558,7 @@ impl Context3D for WgpuContext3D {
                 stencil,
                 mask,
             } => {
-                self.clear_color = Some(ClearColor {
+                let clear = ClearColor {
                     rgb: wgpu::Color {
                         r: red,
                         g: green,
@@ -527,7 +568,8 @@ impl Context3D for WgpuContext3D {
                     mask,
                     depth: depth as f32,
                     stencil,
-                });
+                };
+                self.clear_current_target(clear);
                 self.seen_clear_command = true;
             }
             Context3DCommand::ConfigureBackBuffer {
@@ -1266,7 +1308,6 @@ impl Context3D for WgpuContext3D {
 
         self.set_render_to_back_buffer();
         self.seen_clear_command = false;
-        self.clear_color = None;
     }
 }
 
