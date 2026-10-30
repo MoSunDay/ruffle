@@ -19,7 +19,7 @@ use crate::{
     VertexAttributeFormat, types::*,
 };
 
-const VERTEX_PROGRAM_CONSTANTS: u64 = 128;
+const VERTEX_PROGRAM_CONSTANTS: u64 = 250;
 const FRAGMENT_PROGRAM_CONSTANTS: u64 = 28;
 
 pub const TEXTURE_SAMPLER_START_BIND_INDEX: u32 = 2;

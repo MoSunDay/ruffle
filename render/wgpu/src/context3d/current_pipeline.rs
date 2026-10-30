@@ -62,7 +62,7 @@ use crate::descriptors::Descriptors;
 
 use super::{MAX_VERTEX_ATTRIBUTES, ShaderPairAgal, VertexAttributeInfo};
 
-const AGAL_NUM_VERTEX_CONSTANTS: u64 = 128;
+const AGAL_NUM_VERTEX_CONSTANTS: u64 = 250;
 const AGAL_NUM_FRAGMENT_CONSTANTS: u64 = 28;
 pub(super) const AGAL_FLOATS_PER_REGISTER: u64 = 4;
 
