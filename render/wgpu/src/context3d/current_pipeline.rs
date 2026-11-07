@@ -1,5 +1,5 @@
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use naga_agal::{Filter, SamplerConfig, Wrapping};
+use naga_agal::{Filter, SamplerConfig, VertexAttributeFormat, Wrapping};
 use ruffle_render::backend::{
     Context3DCompareMode, Context3DStencilAction, Context3DTextureFilter, Context3DTriangleFace,
     Context3DVertexBufferFormat, Context3DWrapMode, Texture,
@@ -55,11 +55,13 @@ use std::cell::Cell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 
-use crate::bitmaps::WgpuSamplerConfig;
 use crate::context3d::VertexBufferWrapper;
 use crate::context3d::shader_pair::{ShaderCompileData, ShaderTextureInfo};
 use crate::descriptors::Descriptors;
 
+use super::pipeline_cache::{
+    BindGroupKey, CachedPipeline, PipelineCache, PipelineKey, ShaderIdentity,
+};
 use super::{MAX_VERTEX_ATTRIBUTES, ShaderPairAgal, VertexAttributeInfo};
 
 const AGAL_NUM_VERTEX_CONSTANTS: u64 = 250;
@@ -70,6 +72,16 @@ const VERTEX_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
     AGAL_NUM_VERTEX_CONSTANTS * AGAL_FLOATS_PER_REGISTER * std::mem::size_of::<f32>() as u64;
 const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
     AGAL_NUM_FRAGMENT_CONSTANTS * AGAL_FLOATS_PER_REGISTER * std::mem::size_of::<f32>() as u64;
+
+fn vertex_format(format: Context3DVertexBufferFormat) -> VertexAttributeFormat {
+    match format {
+        Context3DVertexBufferFormat::Float4 => VertexAttributeFormat::Float4,
+        Context3DVertexBufferFormat::Float3 => VertexAttributeFormat::Float3,
+        Context3DVertexBufferFormat::Float2 => VertexAttributeFormat::Float2,
+        Context3DVertexBufferFormat::Float1 => VertexAttributeFormat::Float1,
+        Context3DVertexBufferFormat::Bytes4 => VertexAttributeFormat::Bytes4,
+    }
+}
 
 // The flash Context3D API is similar to OpenGL - it has many methods
 // which modify the current state (`setVertexBufferAt`, `setCulling`, etc.)
@@ -117,6 +129,7 @@ pub struct CurrentPipeline {
     target_format: TextureFormat,
 
     dirty: Cell<bool>,
+    cache: PipelineCache,
 
     // Sampler configuration information for each texture slot.
     // This is updated by `Context3D.setSamplerStateAt`, as well
@@ -159,6 +172,7 @@ impl CurrentPipeline {
             vertex_shader_uniforms,
             fragment_shader_uniforms,
             dirty: Cell::new(true),
+            cache: PipelineCache::new(),
             culling: Context3DTriangleFace::None,
 
             has_depth_texture: false,
@@ -191,15 +205,33 @@ impl CurrentPipeline {
     }
 
     pub fn set_shaders(&mut self, shaders: Option<Rc<ShaderPairAgal>>) {
-        self.dirty.set(true);
+        let shaders_unchanged = match (&self.shaders, &shaders) {
+            (Some(old), Some(new)) => Rc::ptr_eq(old, new),
+            (None, None) => true,
+            _ => false,
+        };
         self.shaders = shaders;
+
+        // `setProgram` always applies the fragment shader's sampler configs, even
+        // when it is the same program that is already bound. The program may have
+        // been re-selected after `setSamplerStateAt`, which has to be overridden.
+        let mut samplers_changed = false;
         if let Some(shaders) = &self.shaders {
             for (i, sampler_config) in shaders.fragment_sampler_configs().iter().enumerate() {
                 // When we call `Context3D.setProgram`, sampler configs from the fragment shader override
                 // any previously set sampler configs (if 'ignoresampler' was set in the program, then the corresponding
                 // array entry will be `None`).
-                self.sampler_configs[i] = sampler_config.unwrap_or(self.sampler_configs[i]);
+                if let Some(sampler_config) = sampler_config {
+                    if self.sampler_configs[i] != *sampler_config {
+                        self.sampler_configs[i] = *sampler_config;
+                        samplers_changed = true;
+                    }
+                }
             }
+        }
+
+        if !shaders_unchanged || samplers_changed {
+            self.dirty.set(true);
         }
     }
 
@@ -212,6 +244,19 @@ impl CurrentPipeline {
             }
         }
         false
+    }
+
+    /// Returns true if `texture` is already bound to `index` (with the same
+    /// cube-map flag), so re-creating the bind group can be skipped.
+    pub fn texture_is_bound(&self, index: usize, texture: &Rc<dyn Texture>, cube: bool) -> bool {
+        self.bound_textures[index]
+            .as_ref()
+            .is_some_and(|bound| bound.cube == cube && Rc::ptr_eq(&bound.id, texture))
+    }
+
+    /// Returns true if no texture is bound to `index`.
+    pub fn texture_slot_is_empty(&self, index: usize) -> bool {
+        self.bound_textures[index].is_none()
     }
 
     pub fn update_texture_at(&mut self, index: usize, texture: Option<BoundTextureData>) {
@@ -279,73 +324,76 @@ impl CurrentPipeline {
     /// Otherwise, returns `None`.
     ///
     /// If the shaders fail to compile, the pipeline stays dirty.
-    pub fn rebuild_pipeline(
+    fn make_pipeline_key(
         &self,
-        descriptors: &Descriptors,
         vertex_attributes: &[Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
-    ) -> Result<Option<(wgpu::RenderPipeline, wgpu::BindGroup)>, naga_agal::Error> {
-        if !self.dirty.get() {
-            return Ok(None);
+    ) -> PipelineKey {
+        let mut texture_infos = [None; 8];
+        for (i, bound_texture) in self.bound_textures.iter().enumerate() {
+            texture_infos[i] = bound_texture
+                .as_ref()
+                .map(|bound_texture| bound_texture.cube);
         }
 
-        let bind_group_label = create_debug_label!("Bind group");
+        let vertex_attributes = vertex_attributes.clone().map(|attr| {
+            attr.map(|attr| {
+                (
+                    attr.buffer.data_32_per_vertex,
+                    vertex_format(attr.format),
+                    attr.offset_in_32bit_units,
+                )
+            })
+        });
 
-        let wgpu_samplers =
-            self.sampler_configs
-                .map(|sampler| match (sampler.wrapping, sampler.filter) {
-                    (Wrapping::Clamp, Filter::Linear) => &descriptors.bitmap_samplers.clamp_linear,
-                    (Wrapping::Clamp, Filter::Nearest) => {
-                        &descriptors.bitmap_samplers.clamp_nearest
-                    }
-                    (Wrapping::Repeat, Filter::Linear) => {
-                        &descriptors.bitmap_samplers.repeat_linear
-                    }
-                    (Wrapping::Repeat, Filter::Nearest) => {
-                        &descriptors.bitmap_samplers.repeat_nearest
-                    }
-                    (Wrapping::ClampURepeatV, Filter::Linear) => {
-                        &descriptors.bitmap_samplers.clamp_u_repeat_v_linear
-                    }
-                    (Wrapping::ClampURepeatV, Filter::Nearest) => {
-                        &descriptors.bitmap_samplers.clamp_u_repeat_v_nearest
-                    }
-                    (Wrapping::RepeatUClampV, Filter::Linear) => {
-                        &descriptors.bitmap_samplers.repeat_u_clamp_v_linear
-                    }
-                    (Wrapping::RepeatUClampV, Filter::Nearest) => {
-                        &descriptors.bitmap_samplers.repeat_u_clamp_v_nearest
-                    }
-                    (
-                        wrapping,
-                        Filter::Anisotropic2x
-                        | Filter::Anisotropic4x
-                        | Filter::Anisotropic8x
-                        | Filter::Anisotropic16x,
-                    ) => {
-                        &descriptors.bitmap_samplers.anisotropic[&WgpuSamplerConfig {
-                            anisotropy_clamp: match sampler.filter {
-                                Filter::Anisotropic2x => 2,
-                                Filter::Anisotropic4x => 4,
-                                Filter::Anisotropic8x => 8,
-                                Filter::Anisotropic16x => 16,
-                                _ => unreachable!(),
-                            },
-                            address_mode_u: match wrapping {
-                                Wrapping::Clamp => wgpu::AddressMode::ClampToEdge,
-                                Wrapping::Repeat => wgpu::AddressMode::Repeat,
-                                Wrapping::ClampURepeatV => wgpu::AddressMode::ClampToEdge,
-                                Wrapping::RepeatUClampV => wgpu::AddressMode::Repeat,
-                            },
-                            address_mode_v: match wrapping {
-                                Wrapping::Clamp => wgpu::AddressMode::ClampToEdge,
-                                Wrapping::Repeat => wgpu::AddressMode::Repeat,
-                                Wrapping::ClampURepeatV => wgpu::AddressMode::Repeat,
-                                Wrapping::RepeatUClampV => wgpu::AddressMode::ClampToEdge,
-                            },
-                        }]
-                    }
-                });
+        PipelineKey {
+            shaders: self.shaders.clone().map(ShaderIdentity::new),
+            culling: match self.culling {
+                Context3DTriangleFace::None => 0,
+                Context3DTriangleFace::Back => 1,
+                Context3DTriangleFace::Front => 2,
+                Context3DTriangleFace::FrontAndBack => 3,
+            },
+            texture_infos,
+            vertex_attributes,
+            has_depth_texture: self.has_depth_texture,
+            color_mask: self.color_mask,
+            depth_mask: self.depth_mask,
+            pass_compare_mode: self.pass_compare_mode,
+            stencil: self.stencil.clone(),
+            color_component: self.color_component,
+            alpha_component: self.alpha_component,
+            sample_count: self.sample_count,
+            target_format: self.target_format,
+        }
+    }
 
+    fn make_bind_group_key(
+        &self,
+        pipeline: PipelineKey,
+        samplers: &[&wgpu::Sampler; 8],
+    ) -> BindGroupKey {
+        BindGroupKey {
+            pipeline,
+            textures: std::array::from_fn(|i| {
+                self.bound_textures[i]
+                    .as_ref()
+                    .map(|texture| texture.view.clone())
+            }),
+            cubes: std::array::from_fn(|i| {
+                self.bound_textures[i]
+                    .as_ref()
+                    .is_some_and(|texture| texture.cube)
+            }),
+            samplers: std::array::from_fn(|i| (*samplers[i]).clone()),
+        }
+    }
+
+    fn build_bind_group(
+        &self,
+        descriptors: &Descriptors,
+        layout: &wgpu::BindGroupLayout,
+        wgpu_samplers: &[&wgpu::Sampler; 8],
+    ) -> wgpu::BindGroup {
         let mut bind_group_entries = vec![
             BindGroupEntry {
                 binding: 0,
@@ -378,6 +426,21 @@ impl CurrentPipeline {
             }
         }
 
+        let bind_group_label = create_debug_label!("Bind group");
+        descriptors
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: bind_group_label.as_deref(),
+                layout,
+                entries: &bind_group_entries,
+            })
+    }
+
+    fn build_pipeline(
+        &self,
+        descriptors: &Descriptors,
+        vertex_attributes: &[Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
+    ) -> Result<CachedPipeline, naga_agal::Error> {
         let agal_attributes = vertex_attributes.clone().map(|attr| {
             attr.map(|attr| match attr.format {
                 Context3DVertexBufferFormat::Float4 => naga_agal::VertexAttributeFormat::Float4,
@@ -407,25 +470,16 @@ impl CurrentPipeline {
             },
         )?;
 
-        self.dirty.set(false);
-
+        let bind_group_layout = compiled_shaders.bind_group_layout.clone();
         let pipeline_layout_label = create_debug_label!("Pipeline layout");
         let pipeline_layout =
             descriptors
                 .device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: pipeline_layout_label.as_deref(),
-                    bind_group_layouts: &[Some(&compiled_shaders.bind_group_layout)],
+                    bind_group_layouts: &[Some(&bind_group_layout)],
                     immediate_size: 0,
                 });
-
-        let bind_group = descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: bind_group_label.as_deref(),
-                layout: &compiled_shaders.bind_group_layout,
-                entries: &bind_group_entries,
-            });
 
         struct BufferData {
             buffer: Rc<VertexBufferWrapper>,
@@ -549,7 +603,7 @@ impl CurrentPipeline {
             })
             .collect::<Vec<_>>();
 
-        let compiled = descriptors
+        let pipeline = descriptors
             .device
             .create_render_pipeline(&RenderPipelineDescriptor {
                 label: create_debug_label!("RenderPipeline").as_deref(),
@@ -589,12 +643,60 @@ impl CurrentPipeline {
                 multiview_mask: None,
                 cache: None,
             });
-        Ok(Some((compiled, bind_group)))
+
+        // `pipeline_layout` is kept alive by the render pipeline internally.
+        drop(pipeline_layout);
+        Ok(CachedPipeline {
+            pipeline,
+            bind_group_layout,
+        })
+    }
+
+    /// If the pipeline is dirty, rebuilds it from the cached pipeline/bind group
+    /// state and returns the handles. Otherwise returns `None`.
+    ///
+    /// If the shaders fail to compile, the pipeline stays dirty.
+    pub fn rebuild_pipeline(
+        &self,
+        descriptors: &Descriptors,
+        vertex_attributes: &[Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
+    ) -> Result<Option<(wgpu::RenderPipeline, wgpu::BindGroup)>, naga_agal::Error> {
+        if !self.dirty.get() {
+            return Ok(None);
+        }
+
+        let key = self.make_pipeline_key(vertex_attributes);
+        let cached = match self.cache.get_pipeline(&key) {
+            Some(cached) => cached,
+            None => {
+                let cached = self.build_pipeline(descriptors, vertex_attributes)?;
+                self.cache.put_pipeline(key.clone(), cached.clone());
+                cached
+            }
+        };
+
+        let wgpu_samplers = super::samplers::wgpu_samplers(descriptors, &self.sampler_configs);
+        let bind_group_key = self.make_bind_group_key(key, &wgpu_samplers);
+        let bind_group = match self.cache.get_bind_group(&bind_group_key) {
+            Some(bind_group) => bind_group,
+            None => {
+                let bind_group =
+                    self.build_bind_group(descriptors, &cached.bind_group_layout, &wgpu_samplers);
+                self.cache
+                    .put_bind_group(bind_group_key, bind_group.clone());
+                bind_group
+            }
+        };
+
+        self.dirty.set(false);
+        Ok(Some((cached.pipeline, bind_group)))
     }
 
     pub fn set_culling(&mut self, face: Context3DTriangleFace) {
-        self.culling = face;
-        self.dirty.set(true);
+        if self.culling != face {
+            self.culling = face;
+            self.dirty.set(true);
+        }
     }
 
     pub fn update_blend_factors(
@@ -633,8 +735,10 @@ impl CurrentPipeline {
             // FIXME - implement this
             mipmap: naga_agal::Mipmap::Disable,
         };
-        self.dirty.set(true);
-        self.sampler_configs[sampler] = sampler_config;
+        if self.sampler_configs[sampler] != sampler_config {
+            self.dirty.set(true);
+            self.sampler_configs[sampler] = sampler_config;
+        }
     }
 
     pub fn update_stencil_actions(
@@ -662,10 +766,11 @@ impl CurrentPipeline {
             Context3DTriangleFace::FrontAndBack => (stencil_state, stencil_state),
         };
 
-        self.stencil.front = front;
-        self.stencil.back = back;
-
-        self.dirty.set(true);
+        if self.stencil.front != front || self.stencil.back != back {
+            self.stencil.front = front;
+            self.stencil.back = back;
+            self.dirty.set(true);
+        }
     }
 
     pub fn update_stencil_reference_value(

@@ -332,7 +332,7 @@ pub trait Context3D: Any {
     fn present(&mut self);
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Context3DVertexBufferFormat {
     Float1,
     Float2,
@@ -361,7 +361,7 @@ impl FromWStr for Context3DVertexBufferFormat {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Context3DTriangleFace {
     None,
     Back,

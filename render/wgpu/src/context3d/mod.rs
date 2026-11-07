@@ -28,6 +28,8 @@ use std::sync::Arc;
 use tracing::instrument;
 
 mod current_pipeline;
+mod pipeline_cache;
+mod samplers;
 mod shader_pair;
 
 use current_pipeline::CurrentPipeline;
@@ -1006,9 +1008,22 @@ impl Context3D for WgpuContext3D {
                     None
                 };
 
-                self.vertex_attributes[index as usize] = info;
-                self.current_pipeline
-                    .update_vertex_buffer_at(index as usize);
+                let index = index as usize;
+                let unchanged = match (&info, &self.vertex_attributes[index]) {
+                    (Some(new), Some(old)) => {
+                        new.format == old.format
+                            && new.offset_in_32bit_units == old.offset_in_32bit_units
+                            && Rc::ptr_eq(&new.buffer, &old.buffer)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                if unchanged {
+                    return;
+                }
+
+                self.vertex_attributes[index] = info;
+                self.current_pipeline.update_vertex_buffer_at(index);
             }
 
             Context3DCommand::SetShaders { module } => {
@@ -1138,6 +1153,15 @@ impl Context3D for WgpuContext3D {
                 texture,
                 cube,
             } => {
+                let index = sampler as usize;
+                let unchanged = match &texture {
+                    Some(texture) => self.current_pipeline.texture_is_bound(index, texture, cube),
+                    None => self.current_pipeline.texture_slot_is_empty(index),
+                };
+                if unchanged {
+                    return;
+                }
+
                 let bound_texture = if let Some(texture) = texture {
                     let texture_wrapper =
                         <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
