@@ -2044,10 +2044,27 @@ pub trait TDisplayObject<'gc>:
     fn get_render_mask(self) -> RenderMask<'gc> {
         match self.masker() {
             None => RenderMask::None,
-            Some(mask) if self.is_bitmap_cached() && mask.is_bitmap_cached() => {
-                RenderMask::Alpha(mask)
+            Some(mask) => {
+                // Text is rasterized into glyph quads, so a stencil mask would use the whole
+                // quad instead of the glyph shape. Cache the text masker so that we take the
+                // alpha mask path, which samples the glyph alpha.
+                //
+                // A `Bitmap` maskee is already a single texture draw, so it can take the
+                // alpha mask path without being cacheAsBitmap (the underlying gradient
+                // images used by GLabel are plain Bitmaps masked by a TextField).
+                let maskee_supports_alpha = self.is_bitmap_cached() || self.as_bitmap().is_some();
+                if maskee_supports_alpha
+                    && !mask.is_bitmap_cached()
+                    && (mask.as_edit_text().is_some() || mask.as_text().is_some())
+                {
+                    mask.set_bitmap_cached_preference(true);
+                }
+                if maskee_supports_alpha && mask.is_bitmap_cached() {
+                    RenderMask::Alpha(mask)
+                } else {
+                    RenderMask::Stencil(mask)
+                }
             }
-            Some(mask) => RenderMask::Stencil(mask),
         }
     }
 
