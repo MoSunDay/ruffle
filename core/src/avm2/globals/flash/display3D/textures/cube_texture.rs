@@ -47,13 +47,6 @@ pub fn upload_compressed_texture_from_byte_array<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    // This should work, but it's currently untested
-    avm2_stub_method!(
-        activation,
-        "flash.display3D.textures.CubeTexture",
-        "uploadCompressedTextureFromByteArray"
-    );
-
     let texture = this.as_texture().unwrap();
     let data = args.get_object(activation, 0, "data")?;
     let byte_array_offset = args.get_u32(1) as usize;
@@ -67,7 +60,12 @@ pub fn upload_compressed_texture_from_byte_array<'gc>(
         );
     }
 
-    if !matches!(texture.original_format(), Context3DTextureFormat::Bgra) {
+    if !matches!(
+        texture.original_format(),
+        Context3DTextureFormat::Bgra
+            | Context3DTextureFormat::CompressedAlpha
+            | Context3DTextureFormat::Compressed
+    ) {
         avm2_stub_method!(
             activation,
             "flash.display3D.textures.CubeTexture",

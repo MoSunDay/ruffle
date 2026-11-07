@@ -81,7 +81,9 @@ pub fn upload_compressed_texture_from_byte_array_internal<'gc>(
 
     if !matches!(
         texture.original_format(),
-        Context3DTextureFormat::Bgra | Context3DTextureFormat::CompressedAlpha
+        Context3DTextureFormat::Bgra
+            | Context3DTextureFormat::CompressedAlpha
+            | Context3DTextureFormat::Compressed
     ) {
         avm2_stub_method!(
             activation,
