@@ -28,11 +28,14 @@ use std::sync::Arc;
 use tracing::instrument;
 
 mod current_pipeline;
+mod frame_batch;
 mod pipeline_cache;
 mod samplers;
 mod shader_pair;
+mod uniform_ring;
 
 use current_pipeline::CurrentPipeline;
+use frame_batch::FrameBatch;
 
 use self::shader_pair::ShaderPairAgal;
 
@@ -74,7 +77,8 @@ pub struct WgpuContext3D {
 
     vertex_attributes: [Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
 
-    buffer_command_encoder: CommandEncoder,
+    frame_batch: FrameBatch,
+    uniform_offsets: [u32; 2],
     // After a call to 'present()', the Context3D API requires a call to 'clear'
     // before any new calls to 'drawTriangles'. This tracks whether we've
     // seen a `Context3DCommand::Clear` so far.
@@ -121,12 +125,7 @@ impl WgpuContext3D {
         let buffer_staging_belt = StagingBelt::new(descriptors.device.clone(), 1024);
         let current_pipeline = CurrentPipeline::new(&descriptors);
 
-        let buffer_command_encoder =
-            descriptors
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: create_debug_label!("Buffer command encoder").as_deref(),
-                });
+        let frame_batch = FrameBatch::new(&descriptors.device);
 
         Self {
             profile,
@@ -154,10 +153,17 @@ impl WgpuContext3D {
             front_buffer_depth_texture_view: None,
             front_buffer_resolve_texture_view: None,
 
-            buffer_command_encoder,
+            frame_batch,
+            uniform_offsets: [0, 0],
             seen_clear_command: false,
             scissor_rectangle: None,
         }
+    }
+
+    fn flush_frame(&mut self) {
+        self.frame_batch
+            .flush(&self.descriptors.queue, &mut self.buffer_staging_belt);
+        self.current_pipeline.reset_uniform_ring();
     }
 
     fn create_depth_texture(&self, width: u32, height: u32, sample_count: u32) -> TextureView {
@@ -232,12 +238,7 @@ impl WgpuContext3D {
             }
         });
 
-        let mut command_encoder =
-            self.descriptors
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: create_debug_label!("Context3D clear command encoder").as_deref(),
-                });
+        let mut command_encoder = self.frame_batch.take_render();
 
         {
             let _pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -256,7 +257,7 @@ impl WgpuContext3D {
             });
         }
 
-        self.descriptors.queue.submit([command_encoder.finish()]);
+        self.frame_batch.put_render(command_encoder);
     }
 
     fn make_render_pass<'a>(
@@ -301,7 +302,7 @@ impl WgpuContext3D {
             ..Default::default()
         });
         if let Some(bind_group) = self.bind_group.as_ref() {
-            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &self.uniform_offsets);
         }
         if let Some(compiled_pipeline) = self.compiled_pipeline.as_ref() {
             pass.set_pipeline(compiled_pipeline);
@@ -582,6 +583,7 @@ impl Context3D for WgpuContext3D {
                 wants_best_resolution: _,
                 wants_best_resolution_on_browser_zoom: _,
             } => {
+                self.flush_frame();
                 let format = wgpu::TextureFormat::Rgba8Unorm;
 
                 let mut sample_count = anti_alias;
@@ -755,6 +757,7 @@ impl Context3D for WgpuContext3D {
                 start_offset,
                 data,
             } => {
+                self.flush_frame();
                 if data.is_empty() {
                     return;
                 }
@@ -776,7 +779,7 @@ impl Context3D for WgpuContext3D {
                 buffer.data[offset_bytes..(offset_bytes + data.len())].copy_from_slice(data);
                 self.buffer_staging_belt
                     .write_buffer(
-                        &mut self.buffer_command_encoder,
+                        self.frame_batch.upload(),
                         &buffer.buffer,
                         rounded_down_offset as u64,
                         NonZeroU64::new(rounded_up_length as u64).unwrap(),
@@ -793,6 +796,7 @@ impl Context3D for WgpuContext3D {
                 data32_per_vertex,
                 data,
             } => {
+                self.flush_frame();
                 if data.is_empty() {
                     return;
                 }
@@ -804,7 +808,7 @@ impl Context3D for WgpuContext3D {
                 // offset and size will always be a multiple of `COPY_BUFFER_ALIGNMENT` (4 bytes)
                 self.buffer_staging_belt
                     .write_buffer(
-                        &mut self.buffer_command_encoder,
+                        self.frame_batch.upload(),
                         &buffer.buffer,
                         (start_vertex * (data32_per_vertex as usize) * std::mem::size_of::<f32>())
                             as u64,
@@ -820,6 +824,7 @@ impl Context3D for WgpuContext3D {
                 anti_alias,
                 surface_selector,
             } => {
+                self.flush_frame();
                 let mut sample_count = anti_alias;
                 if sample_count == 0 {
                     sample_count = 1;
@@ -947,47 +952,36 @@ impl Context3D for WgpuContext3D {
                     );
                 }
 
-                self.buffer_staging_belt.finish();
-                let new_encoder = self.descriptors.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: create_debug_label!("Buffer command encoder").as_deref(),
-                    },
-                );
-                let finished_buffer_command_encoder =
-                    std::mem::replace(&mut self.buffer_command_encoder, new_encoder);
-
-                // Note - we need to unconditionally re-create the render pass, since we had to submit the
-                // buffer command encoder above.
-
                 if let Some((new_pipeline, new_bind_group)) = new_pipeline {
                     self.compiled_pipeline = Some(new_pipeline);
                     self.bind_group = Some(new_bind_group);
                 }
 
-                let mut render_command_encoder = self.descriptors.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: create_debug_label!("Render command encoder").as_deref(),
-                    },
-                );
-
-                let mut render_pass = self.make_render_pass(&mut render_command_encoder);
-
-                render_pass
-                    .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
-
                 if can_draw {
-                    render_pass.draw_indexed(indices, 0, 0..1);
+                    let offsets = loop {
+                        match self
+                            .current_pipeline
+                            .prepare_uniforms(self.frame_batch.upload())
+                        {
+                            Some(offsets) => break offsets,
+                            // The ring is only a few frames deep. Submit this batch
+                            // and continue with a fresh one.
+                            None => self.flush_frame(),
+                        }
+                    };
+                    self.uniform_offsets = [offsets.0, offsets.1];
                 }
 
-                // A `RenderPass` needs to hold references to several fields in `self`, so we can't
-                // easily re-use it across multiple `DrawTriangles` calls.
-                drop(render_pass);
-
-                self.descriptors.queue.submit([
-                    finished_buffer_command_encoder.finish(),
-                    render_command_encoder.finish(),
-                ]);
-                self.buffer_staging_belt.recall();
+                let mut render_command_encoder = self.frame_batch.take_render();
+                {
+                    let mut render_pass = self.make_render_pass(&mut render_command_encoder);
+                    render_pass
+                        .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    if can_draw {
+                        render_pass.draw_indexed(indices, 0, 0..1);
+                    }
+                }
+                self.frame_batch.put_render(render_command_encoder);
             }
 
             Context3DCommand::SetVertexBufferAt {
@@ -1049,7 +1043,7 @@ impl Context3D for WgpuContext3D {
                     * std::mem::size_of::<f32>() as u64;
 
                 let mut buffer_view = self.buffer_staging_belt.write_buffer(
-                    &mut self.buffer_command_encoder,
+                    self.frame_batch.upload(),
                     buffer,
                     offset,
                     NonZeroU64::new(std::mem::size_of_val(matrix_raw_data_column_major) as u64)
@@ -1071,13 +1065,14 @@ impl Context3D for WgpuContext3D {
                 dest,
                 layer,
             } => {
+                self.flush_frame();
                 let dest = Rc::<dyn Any>::downcast::<TextureWrapper>(dest).unwrap();
 
                 // Unfortunately, we need to copy from the CPU data, rather than using the GPU texture.
                 // The GPU side of a BitmapData can be updated at any time from non-Stage3D code.
-                // If we were to use `self.buffer_command_encoder.copy_texture_to_texture`, the
+                // If we were to use `self.frame_batch.upload().copy_texture_to_texture`, the
                 // BitmapData's gpu texture might be modified before we actually submit
-                // `buffer_command_encoder` to the device.
+                // upload command buffer to the device.
                 let dest_format = dest.texture.format();
                 let src_bytes_per_row = dest_format.block_copy_size(None).unwrap()
                     * (source_width / dest_format.block_dimensions().0);
@@ -1120,7 +1115,7 @@ impl Context3D for WgpuContext3D {
                 drop(texture_buffer_view);
                 texture_buffer.unmap();
 
-                self.buffer_command_encoder.copy_buffer_to_texture(
+                self.frame_batch.upload().copy_buffer_to_texture(
                     wgpu::TexelCopyBufferInfo {
                         buffer: &texture_buffer,
                         // The copy source uses the padded image data, with larger rows
@@ -1309,6 +1304,7 @@ impl Context3D for WgpuContext3D {
 
     #[instrument(level = "debug", skip_all)]
     fn present(&mut self) {
+        self.flush_frame();
         std::mem::swap(
             &mut self.back_buffer_raw_texture_handle,
             &mut self.front_buffer_raw_texture_handle,

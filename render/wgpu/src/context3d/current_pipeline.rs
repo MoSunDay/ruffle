@@ -62,16 +62,12 @@ use crate::descriptors::Descriptors;
 use super::pipeline_cache::{
     BindGroupKey, CachedPipeline, PipelineCache, PipelineKey, ShaderIdentity,
 };
+use super::uniform_ring::{
+    FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE, UniformRing, VERTEX_SHADER_UNIFORMS_BUFFER_SIZE,
+};
 use super::{MAX_VERTEX_ATTRIBUTES, ShaderPairAgal, VertexAttributeInfo};
 
-const AGAL_NUM_VERTEX_CONSTANTS: u64 = 250;
-const AGAL_NUM_FRAGMENT_CONSTANTS: u64 = 28;
 pub(super) const AGAL_FLOATS_PER_REGISTER: u64 = 4;
-
-const VERTEX_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
-    AGAL_NUM_VERTEX_CONSTANTS * AGAL_FLOATS_PER_REGISTER * std::mem::size_of::<f32>() as u64;
-const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
-    AGAL_NUM_FRAGMENT_CONSTANTS * AGAL_FLOATS_PER_REGISTER * std::mem::size_of::<f32>() as u64;
 
 fn vertex_format(format: Context3DVertexBufferFormat) -> VertexAttributeFormat {
     match format {
@@ -108,6 +104,7 @@ pub struct CurrentPipeline {
 
     pub vertex_shader_uniforms: Buffer,
     pub fragment_shader_uniforms: Buffer,
+    uniform_ring: UniformRing,
 
     has_depth_texture: bool,
 
@@ -155,22 +152,25 @@ impl CurrentPipeline {
         let vertex_shader_uniforms = descriptors.device.create_buffer(&BufferDescriptor {
             label: Some("Vertex shader uniforms"),
             size: VERTEX_SHADER_UNIFORMS_BUFFER_SIZE,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let fragment_shader_uniforms = descriptors.device.create_buffer(&BufferDescriptor {
             label: Some("Fragment shader uniforms"),
             size: FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+
+        let uniform_ring = UniformRing::new(&descriptors.device);
 
         CurrentPipeline {
             shaders: None,
             bound_textures: std::array::from_fn(|_| None),
             vertex_shader_uniforms,
             fragment_shader_uniforms,
+            uniform_ring,
             dirty: Cell::new(true),
             cache: PipelineCache::new(),
             culling: Context3DTriangleFace::None,
@@ -202,6 +202,20 @@ impl CurrentPipeline {
 
     pub fn stencil_ref_value(&self) -> u32 {
         self.stencil_ref_value
+    }
+
+    /// Snapshots the current program constants for one draw. Returns the
+    /// dynamic vertex/fragment offsets to bind.
+    pub fn prepare_uniforms(&self, encoder: &mut wgpu::CommandEncoder) -> Option<(u32, u32)> {
+        self.uniform_ring.prepare(
+            encoder,
+            &self.vertex_shader_uniforms,
+            &self.fragment_shader_uniforms,
+        )
+    }
+
+    pub fn reset_uniform_ring(&self) {
+        self.uniform_ring.reset();
     }
 
     pub fn set_shaders(&mut self, shaders: Option<Rc<ShaderPairAgal>>) {
@@ -394,11 +408,12 @@ impl CurrentPipeline {
         layout: &wgpu::BindGroupLayout,
         wgpu_samplers: &[&wgpu::Sampler; 8],
     ) -> wgpu::BindGroup {
+        let (vertex_uniforms, fragment_uniforms) = self.uniform_ring.buffers();
         let mut bind_group_entries = vec![
             BindGroupEntry {
                 binding: 0,
                 resource: BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &self.vertex_shader_uniforms,
+                    buffer: vertex_uniforms,
                     offset: 0,
                     size: Some(NonZeroU64::new(VERTEX_SHADER_UNIFORMS_BUFFER_SIZE).unwrap()),
                 }),
@@ -406,7 +421,7 @@ impl CurrentPipeline {
             BindGroupEntry {
                 binding: 1,
                 resource: BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &self.fragment_shader_uniforms,
+                    buffer: fragment_uniforms,
                     offset: 0,
                     size: Some(NonZeroU64::new(FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE).unwrap()),
                 }),

@@ -4,11 +4,14 @@ use ruffle_render::backend::ShaderModule;
 use std::{
     borrow::Cow,
     cell::{RefCell, RefMut},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
 };
 use wgpu::SamplerBindingType;
 
 use super::MAX_VERTEX_ATTRIBUTES;
+use super::uniform_ring::{
+    FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE, VERTEX_SHADER_UNIFORMS_BUFFER_SIZE,
+};
 
 use crate::descriptors::Descriptors;
 
@@ -85,8 +88,8 @@ impl ShaderPairAgal {
                         visibility: wgpu::ShaderStages::VERTEX,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                            has_dynamic_offset: true,
+                            min_binding_size: NonZeroU64::new(VERTEX_SHADER_UNIFORMS_BUFFER_SIZE),
                         },
                         count: None,
                     },
@@ -96,8 +99,8 @@ impl ShaderPairAgal {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                            has_dynamic_offset: true,
+                            min_binding_size: NonZeroU64::new(FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE),
                         },
                         count: None,
                     },
