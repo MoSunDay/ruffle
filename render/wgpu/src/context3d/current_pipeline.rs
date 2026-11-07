@@ -505,10 +505,11 @@ impl CurrentPipeline {
         let cull_mode = match self.culling {
             Context3DTriangleFace::Back => Some(wgpu::Face::Back),
             Context3DTriangleFace::Front => Some(wgpu::Face::Front),
-            Context3DTriangleFace::FrontAndBack => {
-                tracing::error!("FrontAndBack culling not supported!");
-                None
-            }
+            // Wgpu cannot express culling both faces. Flash treats
+            // FRONT_AND_BACK as "draw nothing", but this game relies on the
+            // triangles still being drawn (observed freeze otherwise), so we
+            // fall back to drawing everything (matching prior behavior).
+            Context3DTriangleFace::FrontAndBack => None,
             Context3DTriangleFace::None => None,
         };
 
