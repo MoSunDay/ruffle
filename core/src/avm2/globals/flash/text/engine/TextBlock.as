@@ -142,5 +142,7 @@ package flash.text.engine {
         public native function get lastLine():TextLine;
 
         public native function releaseLines(start:TextLine, end:TextLine):void;
+
+        public native function releaseLineCreationData():void;
     }
 }

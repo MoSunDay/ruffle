@@ -10,7 +10,8 @@ use crate::avm2::value::Value;
 use crate::avm2::vector::VectorStorage;
 use crate::avm2_stub_getter;
 use crate::display_object::{
-    StageDisplayState, TDisplayObject, TDisplayObjectContainer, TInteractiveObject,
+    DisplayObject, Stage, StageDisplayState, TDisplayObject, TDisplayObjectContainer,
+    TInteractiveObject,
 };
 use crate::string::{AvmString, WString};
 use swf::Color;
@@ -210,12 +211,26 @@ pub fn set_focus<'gc>(
     Ok(Value::Undefined)
 }
 
+/// Worker emulation (route A): non-main stages keep their own frame rate.
+fn worker_stage<'gc>(activation: &Activation<'_, 'gc>, this: Value<'gc>) -> Option<Stage<'gc>> {
+    let dobj = this.as_object()?.as_display_object()?;
+    let stage = dobj.as_stage()?;
+    if DisplayObject::ptr_eq(dobj, activation.context.stage.into()) {
+        None
+    } else {
+        Some(stage)
+    }
+}
+
 /// Implement `frameRate`'s getter
 pub fn get_frame_rate<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Value<'gc>,
+    this: Value<'gc>,
     _args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(stage) = worker_stage(activation, this) {
+        return Ok(stage.frame_rate().into());
+    }
     let mut frame_rate = *activation.context.frame_rate;
     if frame_rate < 0.0 {
         // Uncommon frame rate from the SWF header.
@@ -227,12 +242,16 @@ pub fn get_frame_rate<'gc>(
 /// Implement `frameRate`'s setter
 pub fn set_frame_rate<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Value<'gc>,
+    this: Value<'gc>,
     args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     if !activation.context.forced_frame_rate {
         let new_frame_rate = args.get_f64(0).clamp(0.01, 1000.0);
-        *activation.context.frame_rate = new_frame_rate;
+        if let Some(stage) = worker_stage(activation, this) {
+            stage.set_frame_rate(new_frame_rate);
+        } else {
+            *activation.context.frame_rate = new_frame_rate;
+        }
     }
 
     Ok(Value::Undefined)

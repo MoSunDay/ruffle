@@ -6,6 +6,7 @@ use crate::avm2::object::{Object, TObject};
 use gc_arena::{Collect, Gc, GcWeak};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::{Context3DTextureFormat, Texture};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{ClassObject, Context3DObject};
@@ -26,13 +27,15 @@ impl<'gc> TextureObject<'gc> {
         original_format: Context3DTextureFormat,
         class: ClassObject<'gc>,
     ) -> Object<'gc> {
+        let disposed_handle = context3d.disposed_texture_handle();
         TextureObject(Gc::new(
             activation.gc(),
             TextureObjectData {
                 base: ScriptObjectData::new(class),
                 context3d,
                 original_format,
-                handle,
+                handle: RefCell::new(Some(handle)),
+                disposed_handle,
             },
         ))
         .into()
@@ -43,7 +46,18 @@ impl<'gc> TextureObject<'gc> {
     }
 
     pub fn handle(self) -> Rc<dyn Texture> {
-        self.0.handle.clone()
+        self.0
+            .handle
+            .borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.0.disposed_handle.clone())
+    }
+
+    /// Releases the GPU texture. The ActionScript object may still be alive,
+    /// so `handle()` subsequently returns a shared 1x1 placeholder.
+    pub fn dispose(self) {
+        self.0.handle.borrow_mut().take();
     }
 
     pub fn context3d(self) -> Context3DObject<'gc> {
@@ -64,7 +78,10 @@ pub struct TextureObjectData<'gc> {
     original_format: Context3DTextureFormat,
 
     #[collect(require_static)]
-    handle: Rc<dyn Texture>,
+    handle: RefCell<Option<Rc<dyn Texture>>>,
+
+    #[collect(require_static)]
+    disposed_handle: Rc<dyn Texture>,
 }
 
 impl<'gc> TObject<'gc> for TextureObject<'gc> {

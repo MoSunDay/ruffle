@@ -188,7 +188,7 @@ pub use crate::avm2::object::vertex_buffer_3d_object::{
     VertexBuffer3DObject, VertexBuffer3DObjectWeak,
 };
 pub use crate::avm2::object::worker_domain_object::{WorkerDomainObject, WorkerDomainObjectWeak};
-pub use crate::avm2::object::worker_object::{WorkerObject, WorkerObjectWeak};
+pub use crate::avm2::object::worker_object::{WorkerObject, WorkerObjectWeak, WorkerState};
 pub use crate::avm2::object::xml_list_object::{
     E4XOrXml, XmlListObject, XmlListObjectWeak, xml_list_allocator,
 };
@@ -784,6 +784,7 @@ impl<'gc> Object<'gc> {
         pub fn as_loader_info_object for LoaderInfoObject;
         pub fn as_array_object for ArrayObject;
         pub fn as_bytearray_object for ByteArrayObject;
+        pub fn as_worker_object for WorkerObject;
         pub fn as_vector_object for VectorObject;
         pub fn as_stage_object for StageObject;
         pub fn as_domain_object for DomainObject;

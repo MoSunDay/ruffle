@@ -1,8 +1,4 @@
 package flash.system {
-    import __ruffle__.stub_getter;
-    import __ruffle__.stub_method;
-
-    import flash.events.Event;
     import flash.events.EventDispatcher;
     import flash.system.MessageChannel;
 
@@ -10,37 +6,29 @@ package flash.system {
     [Ruffle(Abstract)]
     public final class Worker extends EventDispatcher {
         public static function get isSupported():Boolean {
-            return false;
+            // Same-arena emulation (route A): workers run on the main thread
+            // in a child ApplicationDomain.
+            return true;
         }
 
-        private static var _current:Worker;
-
-        public static function get current():Worker {
-            stub_getter("flash.system.Worker", "current");
-
-            if (!_current) {
-                _current = instantiateInternal();
-            }
-
-            return _current;
-        }
+        // Returns the worker whose code is currently executing, or the main
+        // worker when called from the root movie.
+        public static native function get current():Worker;
 
         public native function createMessageChannel(receiver:Worker):MessageChannel;
 
-        public function setSharedProperty(key:String, value:*):void {
-            stub_method("flash.system.Worker", "setSharedProperty");
-        }
+        // Shared properties live in the same AVM2 arena and are shared by
+        // reference (Flash semantics for shareable values).
+        public native function setSharedProperty(key:String, value:*):void;
+        public native function getSharedProperty(key:String):*;
 
-        public function getSharedProperty(key:String):* {
-            stub_method("flash.system.Worker", "getSharedProperty");
-        }
+        public native function get state():String;
 
-        public function start():void {
-            this.dispatchEvent(new Event(Event.WORKER_STATE));
+        // Marks the worker running and queues its SWF for boot on the next
+        // player tick. `workerState` is dispatched asynchronously, matching
+        // Flash (listeners may run before the other worker is created).
+        public native function start():void;
 
-            stub_method("flash.system.Worker", "start");
-        }
-
-        private static native function instantiateInternal():Worker;
+        public native function terminate():void;
     }
 }

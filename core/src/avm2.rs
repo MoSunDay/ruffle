@@ -98,6 +98,7 @@ pub use crate::avm2::namespace::{CommonNamespaces, Namespace};
 pub use crate::avm2::object::{
     ArrayObject, BitmapDataObject, ClassObject, EventObject, LoaderInfoObject, Object,
     SharedObjectObject, SoundChannelObject, Stage3DObject, StageObject, TObject,
+    WorkerDomainObject, WorkerObject,
 };
 pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;
@@ -171,6 +172,20 @@ pub struct Avm2<'gc> {
     /// currently present on the display list. This list keeps track of that.
     broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
 
+    /// Same-arena worker emulation (route A, slice 2).
+    /// Worker executed while this is set; `Worker.current` reads it.
+    pub current_worker: Option<WorkerObject<'gc>>,
+    /// Worker created lazily for the main thread's `Worker.current`.
+    pub main_worker: Option<WorkerObject<'gc>>,
+    /// Main thread's `WorkerDomain.current` singleton.
+    pub main_worker_domain: Option<WorkerDomainObject<'gc>>,
+    /// Workers whose SWF should be loaded on the next player tick.
+    pub worker_boot_queue: Vec<WorkerObject<'gc>>,
+    /// Running workers (root movie constructed, pumped every tick).
+    pub workers: Vec<WorkerObject<'gc>>,
+    /// Workers whose `workerState` event should be dispatched next tick.
+    pub worker_state_queue: Vec<WorkerObject<'gc>>,
+
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
 
@@ -227,6 +242,12 @@ impl<'gc> Avm2<'gc> {
             native_custom_constructor_table: Default::default(),
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
+            current_worker: None,
+            main_worker: None,
+            main_worker_domain: None,
+            worker_boot_queue: Vec::new(),
+            workers: Vec::new(),
+            worker_state_queue: Vec::new(),
 
             alias_to_class_map: Default::default(),
             class_to_alias_map: Default::default(),
@@ -439,9 +460,25 @@ impl<'gc> Avm2<'gc> {
             if let Some(object) = object.and_then(|obj| obj.upgrade(context.gc()))
                 && object.is_of_type(on_type.inner_class_definition())
             {
+                // Worker roots share this arena and this broadcast list. Make
+                // `Worker.current` point at the owning worker while its handlers
+                // run, then restore the caller's context.
+                let worker = context
+                    .avm2
+                    .workers
+                    .iter()
+                    .copied()
+                    .find(|worker| worker.owns_root(object));
+                let previous_worker = context.avm2.current_worker;
+                if worker.is_some() {
+                    context.avm2.current_worker = worker;
+                }
+
                 let mut activation = Activation::from_nothing(context);
 
                 events::broadcast_event(&mut activation, object, event);
+
+                activation.context.avm2.current_worker = previous_worker;
             }
         }
         // Once we're done iterating, remove dead weak references from the list.

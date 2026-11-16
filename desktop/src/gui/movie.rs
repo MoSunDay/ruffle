@@ -1,6 +1,7 @@
 use crate::gui::MENU_HEIGHT;
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::{RenderTarget, RenderTargetFrame};
+use ruffle_render_wgpu::utils::{BufferDimensions, buffer_to_image};
 use std::borrow::Cow;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -179,7 +180,9 @@ impl MovieView {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
@@ -217,6 +220,58 @@ impl MovieView {
         render_pass.set_bind_group(0, &self.bind_group, &[]);
         render_pass.set_vertex_buffer(0, renderer.vertices.slice(..));
         render_pass.draw(0..6, 0..1);
+    }
+
+    /// Reads the current movie texture back to the CPU and returns it as an
+    /// RGBA image. Debug-only helper enabled by `RUFFLE_CAPTURE_DIR`.
+    pub fn capture_frame(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> image::RgbaImage {
+        let width = self.texture.width();
+        let height = self.texture.height();
+        let dimensions =
+            BufferDimensions::new(width as usize, height as usize, self.texture.format());
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ruffle capture buffer"),
+            size: dimensions.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Ruffle capture encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(dimensions.padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let index = queue.submit(Some(encoder.finish()));
+        buffer_to_image(
+            device,
+            &buffer,
+            &dimensions,
+            Some(index),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        )
     }
 }
 

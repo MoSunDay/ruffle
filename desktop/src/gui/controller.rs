@@ -20,7 +20,7 @@ use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::utils::{format_list, get_backend_names};
 use std::any::Any;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -48,6 +48,9 @@ pub struct GuiController {
     /// If this is set, we should not render the main menu.
     no_gui: bool,
     theme_controller: ThemeController,
+    capture_dir: Option<PathBuf>,
+    next_capture: Instant,
+    capture_index: u32,
     #[cfg(feature = "tracy_images")]
     tracy_frame_captures: crate::tracy::FrameCapturesHolder,
 }
@@ -178,6 +181,9 @@ impl GuiController {
             size,
             no_gui,
             theme_controller,
+            capture_dir: std::env::var_os("RUFFLE_CAPTURE_DIR").map(PathBuf::from),
+            next_capture: Instant::now(),
+            capture_index: 0,
             #[cfg(feature = "tracy_images")]
             tracy_frame_captures,
         })
@@ -492,6 +498,17 @@ impl GuiController {
 
         command_buffers.push(encoder.finish());
         self.descriptors.queue.submit(command_buffers);
+
+        if let (Some(movie_view), Some(capture_dir)) = (movie_view, self.capture_dir.clone()) {
+            if Instant::now() >= self.next_capture {
+                let image =
+                    movie_view.capture_frame(&self.descriptors.device, &self.descriptors.queue);
+                let path = capture_dir.join(format!("frame_{:05}.png", self.capture_index));
+                let _ = image.save(path);
+                self.capture_index += 1;
+                self.next_capture = Instant::now() + Duration::from_secs(2);
+            }
+        }
 
         // Free textures only after submitting the command buffer that may still
         // reference them.  Destroying a texture before its usage is submitted

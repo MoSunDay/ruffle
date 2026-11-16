@@ -2079,6 +2079,9 @@ impl Player {
         }
 
         self.update(|context| {
+            // Same-arena workers advance before the main stage's enterFrame
+            // broadcast, so worker listeners see the new stage in this tick.
+            crate::worker_runtime::tick_workers(context);
             // TODO: Is this order correct?
             run_all_phases_avm2(context);
             Avm1::run_frame(context);

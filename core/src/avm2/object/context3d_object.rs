@@ -56,6 +56,10 @@ impl<'gc> Context3DObject<'gc> {
         self.0.stage3d
     }
 
+    pub fn disposed_texture_handle(self) -> Rc<dyn Texture> {
+        self.with_context_3d(|context3d| context3d.disposed_texture_handle())
+    }
+
     pub fn with_context_3d<R>(self, f: impl FnOnce(&mut dyn Context3D) -> R) -> R {
         // Temporarily take ownership of the Context3D instance.
         let cell = &self.0.render_context;

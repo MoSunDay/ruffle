@@ -79,6 +79,7 @@ pub struct WgpuContext3D {
 
     frame_batch: FrameBatch,
     uniform_offsets: [u32; 2],
+    disposed_texture: Rc<TextureWrapper>,
     // After a call to 'present()', the Context3D API requires a call to 'clear'
     // before any new calls to 'drawTriangles'. This tracks whether we've
     // seen a `Context3DCommand::Clear` so far.
@@ -127,6 +128,25 @@ impl WgpuContext3D {
 
         let frame_batch = FrameBatch::new(&descriptors.device);
 
+        let disposed_texture_format = wgpu::TextureFormat::Rgba8Unorm;
+        let disposed_texture = Rc::new(TextureWrapper {
+            depth_views: RefCell::new(None),
+            texture: descriptors.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Disposed Context3D texture"),
+                size: Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: disposed_texture_format,
+                view_formats: &[disposed_texture_format],
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            }),
+        });
+
         Self {
             profile,
             descriptors,
@@ -155,6 +175,7 @@ impl WgpuContext3D {
 
             frame_batch,
             uniform_offsets: [0, 0],
+            disposed_texture,
             seen_clear_command: false,
             scissor_rectangle: None,
         }
@@ -367,6 +388,11 @@ pub struct VertexBufferWrapper {
 #[derive(Debug)]
 pub struct TextureWrapper {
     texture: wgpu::Texture,
+    /// Depth/stencil attachment for this texture when used as a render target.
+    /// `setRenderToTexture` may alternate between targets every few draws, so
+    /// creating a new depth texture per call exhausts memory. Keep one per
+    /// texture and sample count, matching Flash's per-surface depth buffer.
+    depth_views: RefCell<Option<(u32, wgpu::TextureView)>>,
 }
 
 impl IndexBuffer for IndexBufferWrapper {}
@@ -458,6 +484,10 @@ impl Context3D for WgpuContext3D {
         todo!()
     }
 
+    fn disposed_texture_handle(&self) -> Rc<dyn ruffle_render::backend::Texture> {
+        self.disposed_texture.clone()
+    }
+
     fn create_texture(
         &mut self,
         width: u32,
@@ -482,6 +512,12 @@ impl Context3D for WgpuContext3D {
             ));
         }
 
+        let max = self.descriptors.limits.max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            tracing::warn!("Context3D texture {width}x{height} exceeds device limit {max}");
+            return Err(Error::TooLarge);
+        }
+
         let texture = self.descriptors.device.create_texture(&TextureDescriptor {
             label: None,
             size: Extent3d {
@@ -496,7 +532,10 @@ impl Context3D for WgpuContext3D {
             view_formats: &[format],
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | render_attachment,
         });
-        Ok(Rc::new(TextureWrapper { texture }))
+        Ok(Rc::new(TextureWrapper {
+            texture,
+            depth_views: RefCell::new(None),
+        }))
     }
 
     fn create_cube_texture(
@@ -507,6 +546,12 @@ impl Context3D for WgpuContext3D {
         streaming_levels: u32,
     ) -> Result<Rc<dyn ruffle_render::backend::Texture>, Error> {
         let format = convert_texture_format(format);
+
+        let max = self.descriptors.limits.max_texture_dimension_2d;
+        if size == 0 || size > max {
+            tracing::warn!("Context3D cube texture size {size} exceeds device limit {max}");
+            return Err(Error::TooLarge);
+        }
 
         if streaming_levels != 0 {
             tracing::warn!(
@@ -534,7 +579,10 @@ impl Context3D for WgpuContext3D {
                 | TextureUsages::COPY_DST
                 | TextureUsages::RENDER_ATTACHMENT,
         });
-        Ok(Rc::new(TextureWrapper { texture }))
+        Ok(Rc::new(TextureWrapper {
+            texture,
+            depth_views: RefCell::new(None),
+        }))
     }
 
     fn upload_shaders(
@@ -894,11 +942,25 @@ impl Context3D for WgpuContext3D {
                 }
 
                 if enable_depth_and_stencil {
-                    self.current_depth_texture_view = Some(self.create_depth_texture(
-                        texture_wrapper.texture.width(),
-                        texture_wrapper.texture.height(),
-                        sample_count,
-                    ));
+                    let depth_view = {
+                        let mut cached = texture_wrapper.depth_views.borrow_mut();
+                        let needs_new = !matches!(
+                            cached.as_ref(),
+                            Some((cached_sample_count, _)) if *cached_sample_count == sample_count
+                        );
+                        if needs_new {
+                            *cached = Some((
+                                sample_count,
+                                self.create_depth_texture(
+                                    texture_wrapper.texture.width(),
+                                    texture_wrapper.texture.height(),
+                                    sample_count,
+                                ),
+                            ));
+                        }
+                        cached.as_ref().unwrap().1.clone()
+                    };
+                    self.current_depth_texture_view = Some(depth_view);
                 } else {
                     self.current_depth_texture_view = None;
                 }

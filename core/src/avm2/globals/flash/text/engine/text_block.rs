@@ -342,6 +342,18 @@ pub fn get_last_line<'gc>(
     Ok(line.unwrap_or(Value::Null))
 }
 
+/// Implements `TextBlock.releaseLineCreationData`
+pub fn release_line_creation_data<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    _this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    // Ruffle does not keep a separate line-creation cache: the block's data is
+    // the lines themselves, and releasing it would invalidate them. Flash
+    // permits this call at any time, so treat it as a no-op.
+    Ok(Value::Undefined)
+}
+
 pub fn release_lines<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,

@@ -312,6 +312,13 @@ pub trait Context3D: Any {
         optimize_for_render_to_texture: bool,
         streaming_levels: u32,
     ) -> Result<Rc<dyn Texture>, Error>;
+
+    /// A shared 1x1 texture used after `TextureBase.dispose`.
+    ///
+    /// Flash keeps the ActionScript object alive after `dispose()`, so we
+    /// cannot drop the field itself. Replacing it with this handle releases
+    /// the real GPU allocation while keeping later accidental use harmless.
+    fn disposed_texture_handle(&self) -> Rc<dyn Texture>;
     fn create_cube_texture(
         &mut self,
         size: u32,

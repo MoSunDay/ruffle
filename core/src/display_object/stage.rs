@@ -78,6 +78,10 @@ pub struct StageData<'gc> {
     /// The swf that registered this stage
     movie: Lock<SwfMovie<'gc>>,
 
+    /// Frame rate for non-main stages (worker emulation, route A).
+    /// The main stage reads/writes `UpdateContext::frame_rate` instead.
+    frame_rate: Cell<f64>,
+
     /// The dimensions of the SWF file.
     movie_size: Cell<(u32, u32)>,
 
@@ -154,6 +158,7 @@ pub struct StageData<'gc> {
 
 impl<'gc> Stage<'gc> {
     pub fn empty(gc_context: &Mutation<'gc>, fullscreen: bool, movie: SwfMovie<'gc>) -> Stage<'gc> {
+        let frame_rate = movie.frame_rate().to_f64();
         let stage = Self(Gc::new(
             gc_context,
             StageData {
@@ -186,6 +191,7 @@ impl<'gc> Stage<'gc> {
                 loader_info: Lock::new(None),
                 stage3ds: RefLock::new(vec![]),
                 movie: Lock::new(movie),
+                frame_rate: Cell::new(frame_rate),
                 viewport_matrix: Cell::new(Matrix::IDENTITY),
                 letterbox_matrix: Cell::new(Matrix::IDENTITY),
                 focus_tracker: FocusTracker::new(gc_context),
@@ -194,6 +200,14 @@ impl<'gc> Stage<'gc> {
         stage.set_is_root(true);
         stage.set_perspective_projection(None); // Set default PerspectiveProjection
         stage
+    }
+
+    pub fn frame_rate(self) -> f64 {
+        self.0.frame_rate.get()
+    }
+
+    pub fn set_frame_rate(self, frame_rate: f64) {
+        self.0.frame_rate.set(frame_rate);
     }
 
     pub fn background_color(self) -> Option<Color> {

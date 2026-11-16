@@ -19,9 +19,24 @@ pub fn do_compressed_upload<'gc>(
     is_cube: bool,
 ) -> Result<(), Error<'gc>> {
     let bytes = data.as_bytearray().unwrap();
-    let raw_atf = &ByteArrayStorage::bytes(&bytes)[byte_array_offset..];
+    let Some(raw_atf) = ByteArrayStorage::bytes(&bytes).get(byte_array_offset..) else {
+        return Err(make_error_3679(activation));
+    };
 
-    let atf_texture = ATFTexture::from_bytes(raw_atf).expect("Failed to parse ATF texture");
+    // Some 2016-era MU assets use an ATF variant this reader does not
+    // understand (an unexpected EOF). Flash only skips the bad upload, so do
+    // the same instead of aborting the caller's enterFrame handler.
+    let atf_texture = match ATFTexture::from_bytes(raw_atf) {
+        Ok(texture) => texture,
+        Err(e) => {
+            tracing::warn!(
+                "Skipping ATF texture ({} bytes at offset {}): {e}",
+                raw_atf.len(),
+                byte_array_offset
+            );
+            return Ok(());
+        }
+    };
 
     if atf_texture.width != texture.handle().width()
         || atf_texture.height != texture.handle().height()
