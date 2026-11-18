@@ -15,6 +15,7 @@ wgpu = { workspace = true, features = ["naga-ir"] }
 tracing = { workspace = true }
 ruffle_render = { path = "..", features = ["tessellator", "wgpu"] }
 bytemuck = { workspace = true, features = ["derive"] }
+half = "2.7"
 clap = { workspace = true, optional = true }
 enum-map = { workspace = true }
 fnv = { workspace = true }

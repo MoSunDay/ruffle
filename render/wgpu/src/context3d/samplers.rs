@@ -1,4 +1,4 @@
-use naga_agal::{Filter, SamplerConfig, Wrapping};
+use naga_agal::{Filter, Mipmap, SamplerConfig, Wrapping};
 
 use crate::bitmaps::WgpuSamplerConfig;
 use crate::descriptors::Descriptors;
@@ -8,51 +8,35 @@ pub(super) fn wgpu_samplers<'a>(
     descriptors: &'a Descriptors,
     sampler_configs: &[SamplerConfig; 8],
 ) -> [&'a wgpu::Sampler; 8] {
-    sampler_configs.map(|sampler| match (sampler.wrapping, sampler.filter) {
-        (Wrapping::Clamp, Filter::Linear) => &descriptors.bitmap_samplers.clamp_linear,
-        (Wrapping::Clamp, Filter::Nearest) => &descriptors.bitmap_samplers.clamp_nearest,
-        (Wrapping::Repeat, Filter::Linear) => &descriptors.bitmap_samplers.repeat_linear,
-        (Wrapping::Repeat, Filter::Nearest) => &descriptors.bitmap_samplers.repeat_nearest,
-        (Wrapping::ClampURepeatV, Filter::Linear) => {
-            &descriptors.bitmap_samplers.clamp_u_repeat_v_linear
-        }
-        (Wrapping::ClampURepeatV, Filter::Nearest) => {
-            &descriptors.bitmap_samplers.clamp_u_repeat_v_nearest
-        }
-        (Wrapping::RepeatUClampV, Filter::Linear) => {
-            &descriptors.bitmap_samplers.repeat_u_clamp_v_linear
-        }
-        (Wrapping::RepeatUClampV, Filter::Nearest) => {
-            &descriptors.bitmap_samplers.repeat_u_clamp_v_nearest
-        }
-        (
-            wrapping,
-            Filter::Anisotropic2x
-            | Filter::Anisotropic4x
-            | Filter::Anisotropic8x
-            | Filter::Anisotropic16x,
-        ) => {
-            &descriptors.bitmap_samplers.anisotropic[&WgpuSamplerConfig {
-                anisotropy_clamp: match sampler.filter {
-                    Filter::Anisotropic2x => 2,
-                    Filter::Anisotropic4x => 4,
-                    Filter::Anisotropic8x => 8,
-                    Filter::Anisotropic16x => 16,
-                    _ => unreachable!(),
-                },
-                address_mode_u: match wrapping {
-                    Wrapping::Clamp => wgpu::AddressMode::ClampToEdge,
-                    Wrapping::Repeat => wgpu::AddressMode::Repeat,
-                    Wrapping::ClampURepeatV => wgpu::AddressMode::ClampToEdge,
-                    Wrapping::RepeatUClampV => wgpu::AddressMode::Repeat,
-                },
-                address_mode_v: match wrapping {
-                    Wrapping::Clamp => wgpu::AddressMode::ClampToEdge,
-                    Wrapping::Repeat => wgpu::AddressMode::Repeat,
-                    Wrapping::ClampURepeatV => wgpu::AddressMode::Repeat,
-                    Wrapping::RepeatUClampV => wgpu::AddressMode::ClampToEdge,
-                },
-            }]
-        }
+    sampler_configs.map(|sampler| {
+        let (filter, anisotropy_clamp) = match sampler.filter {
+            Filter::Nearest => (0, 1),
+            Filter::Linear => (1, 1),
+            Filter::Anisotropic2x => (2, 2),
+            Filter::Anisotropic4x => (3, 4),
+            Filter::Anisotropic8x => (4, 8),
+            Filter::Anisotropic16x => (5, 16),
+        };
+        let mipmap = match sampler.mipmap {
+            Mipmap::Disable => 0,
+            Mipmap::Nearest => 1,
+            Mipmap::Linear => 2,
+        };
+        let (address_mode_u, address_mode_v) = match sampler.wrapping {
+            Wrapping::Clamp => (
+                wgpu::AddressMode::ClampToEdge,
+                wgpu::AddressMode::ClampToEdge,
+            ),
+            Wrapping::Repeat => (wgpu::AddressMode::Repeat, wgpu::AddressMode::Repeat),
+            Wrapping::ClampURepeatV => (wgpu::AddressMode::ClampToEdge, wgpu::AddressMode::Repeat),
+            Wrapping::RepeatUClampV => (wgpu::AddressMode::Repeat, wgpu::AddressMode::ClampToEdge),
+        };
+        &descriptors.bitmap_samplers.stage3d[&WgpuSamplerConfig {
+            anisotropy_clamp,
+            address_mode_u,
+            address_mode_v,
+            filter,
+            mipmap,
+        }]
     })
 }

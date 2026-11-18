@@ -249,6 +249,21 @@ impl CurrentPipeline {
         }
     }
 
+    pub fn has_shaders(&self) -> bool {
+        self.shaders.is_some()
+    }
+
+    /// Number of fragment texture/sampler slots understood by the shader
+    /// model. The arrays are fixed-size; exposing the length lets the command
+    /// layer reject out-of-range AS3 sampler indices before indexing.
+    pub fn bound_texture_count(&self) -> usize {
+        self.bound_textures.len()
+    }
+
+    pub fn sampler_count(&self) -> usize {
+        self.sampler_configs.len()
+    }
+
     pub fn has_unbound_required_textures(&self) -> bool {
         if let Some(shaders) = &self.shaders {
             for (i, sampler_config) in shaders.fragment_sampler_configs().iter().enumerate() {
@@ -477,7 +492,10 @@ impl CurrentPipeline {
             }
         }
 
-        let compiled_shaders = self.shaders.as_ref().expect("Missing shaders!").compile(
+        let Some(shaders) = self.shaders.as_ref() else {
+            return Err(naga_agal::Error::MissingVertexAttributeData);
+        };
+        let compiled_shaders = shaders.compile(
             descriptors,
             ShaderCompileData {
                 vertex_attributes: agal_attributes,
@@ -594,26 +612,32 @@ impl CurrentPipeline {
             None
         };
 
+        // This value is set when Context3D.createVertexBuffer is called.
+        // We may not use all of the data associated with a single vertex
+        // (e.g. we might have 8 floats per vertex, but only call
+        // setVertexBufferAt once to bind the first 4 floats per vertex).
+        // However, the total size of the bindings can be at most the total
+        // amount of data per vertex. A game can trigger this with a bad
+        // binding, so fail the pipeline build instead of aborting the player.
+        for data in &index_per_buffer {
+            let data_bytes_per_vertex = (data.buffer.data_32_per_vertex * 4) as usize;
+            if data.total_size > data_bytes_per_vertex {
+                tracing::warn!(
+                    "Total size of bound vertex attributes {:?} exceeds data_bytes_per_vertex {:?}",
+                    data.total_size,
+                    data_bytes_per_vertex
+                );
+                return Err(naga_agal::Error::MissingVertexAttributeData);
+            }
+        }
         let wgpu_vertex_buffers = index_per_buffer
             .iter()
             .map(|data| {
-                // This value is set when Context3D.createVertexBuffer is called.
-                // We may not all of the data associated with a single vertex
-                // (e.g. we might have 8 floats per vertex, but only
-                // call setVertexBufferAt once to bind the first 4 floats per vertex.
-                // However, the total size of the bindings can be at most the total
-                // amount of data per vertex. Verify that here
                 let data_bytes_per_vertex = (data.buffer.data_32_per_vertex * 4) as u64;
-                if data.total_size > data_bytes_per_vertex as usize {
-                    panic!("Total size of bound vertex attributes {:?} exceeds data_bytes_per_vertex {:?}", data.total_size,
-                    data_bytes_per_vertex);
-                }
-
-                let attrs = &data.attrs;
                 Some(wgpu::VertexBufferLayout {
                     array_stride: data_bytes_per_vertex,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: attrs,
+                    attributes: &data.attrs,
                 })
             })
             .collect::<Vec<_>>();
@@ -731,6 +755,7 @@ impl CurrentPipeline {
         sampler: usize,
         wrap: ruffle_render::backend::Context3DWrapMode,
         filter: ruffle_render::backend::Context3DTextureFilter,
+        mip_filter: ruffle_render::backend::Context3DMipFilter,
     ) {
         let sampler_config = SamplerConfig {
             wrapping: match wrap {
@@ -747,8 +772,11 @@ impl CurrentPipeline {
                 Context3DTextureFilter::Anisotropic8X => Filter::Anisotropic8x,
                 Context3DTextureFilter::Anisotropic16X => Filter::Anisotropic16x,
             },
-            // FIXME - implement this
-            mipmap: naga_agal::Mipmap::Disable,
+            mipmap: match mip_filter {
+                ruffle_render::backend::Context3DMipFilter::None => naga_agal::Mipmap::Disable,
+                ruffle_render::backend::Context3DMipFilter::Nearest => naga_agal::Mipmap::Nearest,
+                ruffle_render::backend::Context3DMipFilter::Linear => naga_agal::Mipmap::Linear,
+            },
         };
         if self.sampler_configs[sampler] != sampler_config {
             self.dirty.set(true);

@@ -1,6 +1,7 @@
 use crate::avm2::Activation;
 use crate::avm2::Error;
 use crate::avm2::Value;
+use crate::avm2::error::make_error_1034;
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::parameters::ParametersExt;
 
@@ -36,9 +37,15 @@ pub fn upload_from_bitmap_data<'gc>(
                 &source.sync(activation.context.renderer).borrow(),
                 texture.handle(),
                 0,
+                0,
             );
         } else {
-            unreachable!("Argument is BitmapData-typed");
+            let bitmapdata_class = activation.avm2().classes().bitmapdata;
+            return Err(make_error_1034(
+                activation,
+                Value::Object(source_obj),
+                bitmapdata_class.inner_class_definition(),
+            ));
         }
     }
     Ok(Value::Undefined)

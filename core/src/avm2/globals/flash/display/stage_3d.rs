@@ -33,25 +33,35 @@ pub fn request_context3d_internal<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this_object = this.as_object().unwrap();
 
-    let this_stage3d = this_object.as_stage_3d().unwrap();
+    let Some(this_stage3d) = this_object.as_stage_3d() else {
+        return Ok(Value::Undefined);
+    };
     let profiles = args.get_object(activation, 1, "profiles")?;
-    let profiles = profiles.as_vector_storage().unwrap();
+    let Some(profiles) = profiles.as_vector_storage() else {
+        tracing::warn!("requestContext3D: profiles is not a Vector; ignoring request");
+        return Ok(Value::Undefined);
+    };
 
     let profile = PROFILES_HIGH_TO_LOW
         .iter()
         .find_map(|(profile, profile_enum)| {
             profiles
                 .iter()
-                .any(|p| {
-                    if let Value::String(p) = p {
-                        &*p == *profile
-                    } else {
-                        unreachable!()
-                    }
+                .any(|p| match p {
+                    Value::String(p) => &*p == *profile,
+                    _ => false,
                 })
                 .then_some(*profile_enum)
         })
-        .unwrap();
+        .unwrap_or_else(|| {
+            // Flash dispatches Context3DErrorEvent here. Ruffle does not yet
+            // expose that class, so fall back to the standard profile rather
+            // than aborting a long-running game loop.
+            tracing::warn!(
+                "requestContext3D: no supported profile in requested list; using standard"
+            );
+            Context3DProfile::Standard
+        });
 
     // Several SWFS (the examples from the Context3D documentation, and the
     // Starling framework) rely on the `context3DCreate` being fired

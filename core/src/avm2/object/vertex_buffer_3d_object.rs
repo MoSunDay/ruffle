@@ -6,6 +6,7 @@ use crate::avm2::object::{Object, TObject};
 use gc_arena::{Collect, Gc, GcWeak};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::VertexBuffer;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::Context3DObject;
@@ -24,23 +25,36 @@ impl<'gc> VertexBuffer3DObject<'gc> {
         context3d: Context3DObject<'gc>,
         handle: Rc<dyn VertexBuffer>,
         data32_per_vertex: u8,
+        num_vertices: u32,
     ) -> Object<'gc> {
         let class = activation.avm2().classes().vertexbuffer3d;
+        let disposed_handle = context3d.disposed_vertex_buffer_handle();
 
         VertexBuffer3DObject(Gc::new(
             activation.gc(),
             VertexBuffer3DObjectData {
                 base: ScriptObjectData::new(class),
                 context3d,
-                handle,
+                handle: RefCell::new(Some(handle)),
+                disposed_handle,
                 data32_per_vertex,
+                num_vertices,
             },
         ))
         .into()
     }
 
     pub fn handle(self) -> Rc<dyn VertexBuffer> {
-        self.0.handle.clone()
+        self.0
+            .handle
+            .borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.0.disposed_handle.clone())
+    }
+
+    pub fn dispose(self) {
+        self.0.handle.borrow_mut().take();
     }
 
     pub fn context3d(self) -> Context3DObject<'gc> {
@@ -49,6 +63,11 @@ impl<'gc> VertexBuffer3DObject<'gc> {
 
     pub fn data32_per_vertex(self) -> u8 {
         self.0.data32_per_vertex
+    }
+
+    /// Capacity passed to `Context3D.createVertexBuffer`.
+    pub fn num_vertices(self) -> u32 {
+        self.0.num_vertices
     }
 }
 
@@ -62,12 +81,17 @@ pub struct VertexBuffer3DObjectData<'gc> {
     context3d: Context3DObject<'gc>,
 
     #[collect(require_static)]
-    handle: Rc<dyn VertexBuffer>,
+    handle: RefCell<Option<Rc<dyn VertexBuffer>>>,
+
+    #[collect(require_static)]
+    disposed_handle: Rc<dyn VertexBuffer>,
 
     /// The 'data32PerVertex' value that this object was created with.
     /// This is the number of 32-bit values associated with each vertex,
     /// and is at most 64
     data32_per_vertex: u8,
+
+    num_vertices: u32,
 }
 
 impl<'gc> TObject<'gc> for VertexBuffer3DObject<'gc> {

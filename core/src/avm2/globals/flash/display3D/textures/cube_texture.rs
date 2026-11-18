@@ -1,12 +1,10 @@
-use ruffle_render::backend::Context3DTextureFormat;
-
 use crate::avm2::Activation;
 use crate::avm2::Error;
 use crate::avm2::Value;
+use crate::avm2::error::make_error_1034;
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::flash::display3D::textures::atf_jpegxr::do_compressed_upload;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2_stub_method;
 
 use super::texture::do_copy;
 
@@ -17,12 +15,6 @@ pub fn upload_from_byte_array<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    // This should work, but it's currently untested
-    avm2_stub_method!(
-        activation,
-        "flash.display3D.textures.CubeTexture",
-        "uploadFromByteArray"
-    );
     let texture = this.as_texture().unwrap();
     let data = args.get_object(activation, 0, "data")?;
     let byte_array_offset = args.get_u32(1);
@@ -50,30 +42,9 @@ pub fn upload_compressed_texture_from_byte_array<'gc>(
     let texture = this.as_texture().unwrap();
     let data = args.get_object(activation, 0, "data")?;
     let byte_array_offset = args.get_u32(1) as usize;
-    let async_ = args.get_bool(2);
-    if async_ {
-        avm2_stub_method!(
-            activation,
-            "flash.display3D.textures.CubeTexture",
-            "uploadCompressedTextureFromByteArray",
-            "with async"
-        );
-    }
-
-    if !matches!(
-        texture.original_format(),
-        Context3DTextureFormat::Bgra
-            | Context3DTextureFormat::CompressedAlpha
-            | Context3DTextureFormat::Compressed
-    ) {
-        avm2_stub_method!(
-            activation,
-            "flash.display3D.textures.CubeTexture",
-            "uploadCompressedTextureFromByteArray",
-            "with unsupported format"
-        );
-        return Ok(Value::Undefined);
-    }
+    // The upload is synchronous and copies the data eagerly, so the async
+    // hint can be accepted without changing behaviour.
+    let _async_ = args.get_bool(2);
 
     do_compressed_upload(activation, texture, data, byte_array_offset, true)?;
     Ok(Value::Undefined)
@@ -92,23 +63,19 @@ pub fn upload_from_bitmap_data<'gc>(
         if let Some(source) = source_obj.as_bitmap_data() {
             let side = args.get_u32(1);
             let mip_level = args.get_u32(2);
-            if mip_level == 0 {
-                texture.context3d().copy_bitmapdata_to_texture(
-                    &source.sync(activation.context.renderer).borrow(),
-                    texture.handle(),
-                    // FIXME - is this right?
-                    side,
-                );
-            } else {
-                avm2_stub_method!(
-                    activation,
-                    "flash.display3D.textures.CubeTexture",
-                    "uploadFromBitmapData",
-                    "with miplevel != 0"
-                );
-            }
+            texture.context3d().copy_bitmapdata_to_texture(
+                &source.sync(activation.context.renderer).borrow(),
+                texture.handle(),
+                side,
+                mip_level,
+            );
         } else {
-            unreachable!("Argument is BitmapData-typed");
+            let bitmapdata_class = activation.avm2().classes().bitmapdata;
+            return Err(make_error_1034(
+                activation,
+                Value::Object(source_obj),
+                bitmapdata_class.inner_class_definition(),
+            ));
         }
     }
     Ok(Value::Undefined)

@@ -45,6 +45,10 @@ impl<'gc> Program3DObject<'gc> {
     pub fn context3d(self) -> Context3DObject<'gc> {
         self.0.context3d
     }
+
+    pub fn dispose(self) {
+        self.0.shader_module_handle.borrow_mut().take();
+    }
 }
 
 #[derive(Collect, HasPrefixField)]

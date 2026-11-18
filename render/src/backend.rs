@@ -151,6 +151,15 @@ pub trait ShaderModule: Any {}
 pub trait Texture: Any + Debug {
     fn width(&self) -> u32;
     fn height(&self) -> u32;
+
+    /// Number of mip levels allocated for this texture.
+    ///
+    /// Stage3D only guarantees the base level for ordinary textures, so the
+    /// default implementation reports one level for backends that do not
+    /// support mip chains.
+    fn mip_levels(&self) -> u32 {
+        1
+    }
 }
 
 pub trait RawTexture: Any + Debug {
@@ -270,6 +279,12 @@ impl FromWStr for ProgramType {
 
 pub trait Context3D: Any {
     fn profile(&self) -> Context3DProfile;
+
+    /// Human-readable information about the underlying graphics driver.
+    fn driver_info(&self) -> String;
+
+    /// The largest supported 2D texture dimension.
+    fn max_texture_size(&self) -> u32;
     // The BitmapHandle for the texture we're rendering to
     fn bitmap_handle(&self) -> BitmapHandle;
     // The BitmapHandle for the current back buffer texture, or `None` if the back
@@ -295,8 +310,7 @@ pub trait Context3D: Any {
     // objects after dispose() has been called.
     fn disposed_vertex_buffer_handle(&self) -> Rc<dyn VertexBuffer>;
 
-    fn create_index_buffer(&mut self, usage: BufferUsage, num_indices: u32)
-    -> Box<dyn IndexBuffer>;
+    fn create_index_buffer(&mut self, usage: BufferUsage, num_indices: u32) -> Rc<dyn IndexBuffer>;
     fn create_vertex_buffer(
         &mut self,
         usage: BufferUsage,
@@ -537,6 +551,29 @@ impl FromWStr for Context3DTextureFilter {
         }
     }
 }
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Context3DMipFilter {
+    None,
+    Nearest,
+    Linear,
+}
+
+impl FromWStr for Context3DMipFilter {
+    type Err = ();
+
+    fn from_wstr(s: &WStr) -> Result<Self, Self::Err> {
+        if s == b"mipnone" {
+            Ok(Context3DMipFilter::None)
+        } else if s == b"mipnearest" {
+            Ok(Context3DMipFilter::Nearest)
+        } else if s == b"miplinear" {
+            Ok(Context3DMipFilter::Linear)
+        } else {
+            Err(())
+        }
+    }
+}
 pub enum Context3DCommand<'a> {
     Clear {
         red: f64,
@@ -564,7 +601,7 @@ pub enum Context3DCommand<'a> {
     SetRenderToBackBuffer,
 
     UploadToIndexBuffer {
-        buffer: &'a mut dyn IndexBuffer,
+        buffer: Rc<dyn IndexBuffer>,
         start_offset: usize,
         data: &'a [u8],
     },
@@ -603,8 +640,12 @@ pub enum Context3DCommand<'a> {
         source: &'a [u8],
         source_width: u32,
         source_height: u32,
+        /// `source` is RGBA8 (from a BitmapData). When false, `source` is
+        /// already in the destination texture's native format.
+        source_is_rgba8: bool,
         dest: Rc<dyn Texture>,
         layer: u32,
+        mip_level: u32,
     },
     SetTextureAt {
         sampler: u32,
@@ -629,6 +670,7 @@ pub enum Context3DCommand<'a> {
         sampler: u32,
         wrap: Context3DWrapMode,
         filter: Context3DTextureFilter,
+        mip_filter: Context3DMipFilter,
     },
     SetScissorRectangle {
         rect: Option<Rectangle<Twips>>,

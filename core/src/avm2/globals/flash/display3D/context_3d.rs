@@ -4,20 +4,122 @@ use crate::avm2::TObject as _;
 use crate::avm2::Value;
 use crate::avm2::error::{
     make_error_2008, make_error_3669, make_error_3670, make_error_3671, make_error_3692,
-    make_error_3771, make_error_3772, make_error_3773, make_error_3780, make_error_3781,
+    make_error_3746, make_error_3762, make_error_3771, make_error_3772, make_error_3773,
+    make_error_3780, make_error_3781,
 };
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::slots::flash_geom_rectangle as rectangle_slots;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2_stub_method;
+use crate::string::AvmString;
 use ruffle_macros::istr;
-use ruffle_render::backend::BufferUsage;
-use ruffle_render::backend::{Context3DProfile, Context3DTextureFilter};
+use ruffle_render::backend::Context3DProfile;
+use ruffle_render::backend::Context3DTextureFormat;
+use ruffle_render::backend::{BufferUsage, ProgramType};
 use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
 use ruffle_render::commands::{CommandHandler, CommandList};
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
 use swf::{Rectangle, Twips};
+
+/// Maximum program constant registers exposed by the Stage3D profile used
+/// by Ruffle (AGAL v2 / standard profile). These must match the uniform
+/// buffers sized by the renderer.
+const MAX_VERTEX_PROGRAM_CONSTANTS: u32 = 250;
+const MAX_FRAGMENT_PROGRAM_CONSTANTS: u32 = 28;
+
+fn program_constant_limit(program_type: &ProgramType) -> u32 {
+    match program_type {
+        ProgramType::Vertex => MAX_VERTEX_PROGRAM_CONSTANTS,
+        ProgramType::Fragment => MAX_FRAGMENT_PROGRAM_CONSTANTS,
+    }
+}
+
+/// Reject writes that would spill outside the shader's constant register
+/// file. The renderer's uniform ring buffers are larger than one program's
+/// register file, so an unchecked write would corrupt a neighbouring slot
+/// instead of producing a wgpu validation error.
+fn check_program_constant_range<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    program_type: &ProgramType,
+    first_register: u32,
+    num_registers: u32,
+) -> Result<(), Error<'gc>> {
+    let end = first_register
+        .checked_add(num_registers)
+        .ok_or_else(|| make_error_3669(activation))?;
+    if end > program_constant_limit(program_type) {
+        return Err(make_error_3669(activation));
+    }
+    Ok(())
+}
+
+pub fn get_driver_info<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    Ok(Value::String(AvmString::new_utf8(
+        activation.gc(),
+        &context.driver_info(),
+    )))
+}
+
+pub fn get_back_buffer_width<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    Ok(Value::Integer(context.back_buffer_width() as i32))
+}
+
+pub fn get_back_buffer_height<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    Ok(Value::Integer(context.back_buffer_height() as i32))
+}
+
+pub fn get_max_back_buffer_width<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    Ok(Value::Integer(context.max_back_buffer_width() as i32))
+}
+
+pub fn set_max_back_buffer_width<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    context.set_max_back_buffer_width(args.get_u32(0));
+    Ok(Value::Undefined)
+}
+
+pub fn get_max_back_buffer_height<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    Ok(Value::Integer(context.max_back_buffer_height() as i32))
+}
+
+pub fn set_max_back_buffer_height<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    context.set_max_back_buffer_height(args.get_u32(0));
+    Ok(Value::Undefined)
+}
 
 pub fn create_index_buffer<'gc>(
     activation: &mut Activation<'_, 'gc>,
@@ -55,6 +157,9 @@ pub fn create_vertex_buffer<'gc>(
             return Err(make_error_3670(activation));
         } else if data_32_per_vertex == 0 {
             return Err(make_error_3671(activation));
+        }
+        if num_vertices == 0 {
+            return Err(make_error_3669(activation));
         }
 
         return Ok(context.create_vertex_buffer(
@@ -105,23 +210,6 @@ pub fn configure_back_buffer<'gc>(
         let wants_best_resolution = args.get_bool(4);
         let wants_best_resolution_on_browser_zoom = args.get_bool(5);
 
-        if wants_best_resolution {
-            avm2_stub_method!(
-                activation,
-                "flash.display3D.Context3D",
-                "configureBackBuffer",
-                "wantsBestResolution"
-            );
-        }
-        if wants_best_resolution_on_browser_zoom {
-            avm2_stub_method!(
-                activation,
-                "flash.display3D.Context3D",
-                "configureBackBuffer",
-                "wantsBestResolutionOnBrowserZoom"
-            );
-        }
-
         context.configure_back_buffer(
             width,
             height,
@@ -152,7 +240,10 @@ pub fn set_vertex_buffer_at<'gc>(
                 .parse()
                 .map_err(|_| make_error_2008(activation, "vertexStreamFormat"))?;
 
-            Some((buffer.as_vertex_buffer().unwrap(), format))
+            let Some(buffer) = buffer.as_vertex_buffer() else {
+                return Err(make_error_3669(activation));
+            };
+            Some((buffer, format))
         } else {
             None
         };
@@ -178,14 +269,21 @@ pub fn create_program<'gc>(
 }
 
 pub fn set_program<'gc>(
-    _activation: &mut Activation<'_, 'gc>,
+    activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,
     args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
     if let Some(context) = this.as_context_3d() {
-        let program = args.try_get_object(0).map(|p| p.as_program_3d().unwrap());
+        let program = match args.try_get_object(0) {
+            Some(program) => Some(
+                program
+                    .as_program_3d()
+                    .ok_or_else(|| make_error_3669(activation))?,
+            ),
+            None => None,
+        };
         context.set_program(program);
     }
     Ok(Value::Undefined)
@@ -202,7 +300,7 @@ pub fn draw_triangles<'gc>(
         let index_buffer = args
             .get_object(activation, 0, "indexBuffer")?
             .as_index_buffer()
-            .unwrap();
+            .ok_or_else(|| make_error_3669(activation))?;
 
         let first_index = args.get_u32(1);
         let num_triangles = args.get_u32(2) as i32;
@@ -236,7 +334,7 @@ pub fn draw_to_bitmap_data<'gc>(
         let destination = args
             .get_object(activation, 0, "destination")?
             .as_bitmap_data()
-            .unwrap();
+            .ok_or_else(|| make_error_3669(activation))?;
 
         // Before the back buffer is configured, Flash silently does nothing.
         let Some(source_handle) = context.with_context_3d(|ctx| ctx.back_buffer_handle()) else {
@@ -344,6 +442,7 @@ pub fn set_program_constants_from_matrix<'gc>(
             .map_err(|_| make_error_2008(activation, "programType"))?;
 
         let first_register = args.get_u32(1);
+        check_program_constant_range(activation, &program_type, first_register, 4)?;
 
         let mut matrix = args
             .get_object(activation, 2, "matrix")?
@@ -391,21 +490,31 @@ pub fn set_program_constants_from_vector<'gc>(
         let first_register = args.get_u32(1);
 
         let vector = args.get_object(activation, 2, "vector")?;
-        let vector = vector.as_vector_storage().unwrap();
+        let Some(vector) = vector.as_vector_storage() else {
+            return Err(make_error_3669(activation));
+        };
 
         let num_registers = args.get_i32(3);
 
-        let to_take = if num_registers != -1 {
-            let required = num_registers as usize * 4;
+        let to_take = if num_registers == -1 {
+            vector.length()
+        } else {
+            let num_registers =
+                usize::try_from(num_registers).map_err(|_| make_error_3669(activation))?;
+            let required = num_registers
+                .checked_mul(4)
+                .ok_or_else(|| make_error_3669(activation))?;
 
             if vector.length() < required {
                 return Err(make_error_3669(activation));
             }
 
             required
-        } else {
-            vector.length()
         };
+
+        let registers =
+            u32::try_from(to_take.div_ceil(4)).map_err(|_| make_error_3669(activation))?;
+        check_program_constant_range(activation, &program_type, first_register, registers)?;
 
         let raw_data = vector
             .iter()
@@ -435,7 +544,9 @@ pub fn set_program_constants_from_byte_array<'gc>(
         let num_registers = args.get_i32(2);
 
         let data = args.get_object(activation, 3, "data")?;
-        let data = data.as_bytearray().expect("Parameter must be a ByteArray");
+        let Some(data) = data.as_bytearray() else {
+            return Err(make_error_3669(activation));
+        };
 
         let byte_offset = args.get_u32(4) as usize;
 
@@ -453,7 +564,12 @@ pub fn set_program_constants_from_byte_array<'gc>(
 
         let (chunks, _) = bytes.as_chunks::<4>();
 
-        let num_floats = num_registers * 4;
+        let registers = u32::try_from(num_registers).map_err(|_| make_error_3669(activation))?;
+        check_program_constant_range(activation, &program_type, first_register, registers)?;
+
+        let num_floats = num_registers
+            .checked_mul(4)
+            .ok_or_else(|| make_error_3669(activation))?;
         let raw_data = chunks
             .get(..num_floats)
             .ok_or_else(|| make_error_3669(activation))?;
@@ -536,6 +652,13 @@ pub fn create_rectangle_texture<'gc>(
             .map_err(|_| make_error_2008(activation, "textureFormat"))?;
         let optimize_for_render_to_texture = args.get_bool(3);
 
+        if matches!(
+            format,
+            Context3DTextureFormat::Compressed | Context3DTextureFormat::CompressedAlpha
+        ) {
+            return Err(make_error_3762(activation));
+        }
+
         let class = activation.avm2().classes().rectangletexture;
 
         return context.create_texture(
@@ -600,7 +723,10 @@ pub fn set_texture_at<'gc>(
                     .inner_class_definition(),
             );
 
-            Some(texture_object.as_texture().unwrap().handle())
+            let texture = texture_object
+                .as_texture()
+                .ok_or_else(|| make_error_3669(activation))?;
+            Some(texture.handle())
         } else {
             None
         };
@@ -684,7 +810,13 @@ pub fn set_render_to_texture<'gc>(
     let texture = args
         .get_object(activation, 0, "texture")?
         .as_texture()
-        .unwrap();
+        .ok_or_else(|| make_error_3669(activation))?;
+    if matches!(
+        texture.original_format(),
+        Context3DTextureFormat::Compressed | Context3DTextureFormat::CompressedAlpha
+    ) {
+        return Err(make_error_3746(activation));
+    }
     let enable_depth_and_stencil = args.get_bool(1);
     let anti_alias = args.get_u32(2);
     let surface_selector = args.get_u32(3);
@@ -705,21 +837,9 @@ pub fn set_render_to_texture<'gc>(
         }
     }
 
-    if anti_alias != 0 {
-        avm2_stub_method!(
-            activation,
-            "flash.display3D.Context3D",
-            "setRenderToTexture",
-            "antiAlias != 0"
-        );
-    }
-
     if color_output_index != 0 {
-        avm2_stub_method!(
-            activation,
-            "flash.display3D.Context3D",
-            "setRenderToTexture",
-            "colorOutputIndex != 0"
+        tracing::warn!(
+            "setRenderToTexture colorOutputIndex {color_output_index} is not supported by wgpu; rendering to color output 0"
         );
     }
 
@@ -830,33 +950,12 @@ pub fn set_sampler_state_at<'gc>(
             .parse()
             .map_err(|_| make_error_2008(activation, "filter"))?;
 
-        let mip_filter = args.get_string_non_null(activation, 3, "mipfilter")?;
+        let mip_filter = args
+            .get_string_non_null(activation, 3, "mipfilter")?
+            .parse()
+            .map_err(|_| make_error_2008(activation, "mipfilter"))?;
 
-        if matches!(
-            filter,
-            Context3DTextureFilter::Anisotropic2X
-                | Context3DTextureFilter::Anisotropic4X
-                | Context3DTextureFilter::Anisotropic8X
-                | Context3DTextureFilter::Anisotropic16X
-        ) {
-            avm2_stub_method!(
-                activation,
-                "flash.display3D.Context3D",
-                "setSamplerStateAt",
-                "filter == 'anisotropic'"
-            );
-        }
-
-        if &*mip_filter != b"mipnone" {
-            avm2_stub_method!(
-                activation,
-                "flash.display3D.Context3D",
-                "setSamplerStateAt",
-                "mipFilter != 'none'"
-            );
-        }
-
-        context.set_sampler_state_at(sampler, wrap, filter);
+        context.set_sampler_state_at(sampler, wrap, filter, mip_filter);
     }
     Ok(Value::Undefined)
 }
@@ -893,14 +992,18 @@ pub fn set_scissor_rectangle<'gc>(
 pub fn dispose<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,
-    _args: FunctionArgs<'_, 'gc>,
+    args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
+    let recreate = args.get_bool(0);
 
-    avm2_stub_method!(activation, "flash.display3D.Context3D", "dispose");
-    this.as_context_3d()
-        .unwrap()
-        .stage3d()
-        .clear_context3d(activation.gc());
+    let context3d = this.as_context_3d().unwrap();
+    let stage3d = context3d.stage3d();
+    if let Some(profile) = context3d.dispose() {
+        stage3d.clear_context3d(activation.gc());
+        if recreate {
+            stage3d.set_requesting_context3d(activation.gc(), profile);
+        }
+    }
     Ok(Value::Undefined)
 }

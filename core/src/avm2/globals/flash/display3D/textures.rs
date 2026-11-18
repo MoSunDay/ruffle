@@ -7,6 +7,7 @@ mod atf_jpegxr;
 mod atf_jpegxr;
 
 pub mod cube_texture;
+pub mod dxt;
 pub mod rectangle_texture;
 pub mod texture;
 pub mod texture_base;

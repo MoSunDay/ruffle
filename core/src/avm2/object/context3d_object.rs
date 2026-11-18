@@ -5,7 +5,6 @@ use crate::avm2::activation::Activation;
 use crate::avm2::object::TObject;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::value::Value;
-use crate::avm2_stub_method;
 use crate::bitmap::bitmap_data::BitmapRawData;
 use crate::context::{RenderContext, UpdateContext};
 use gc_arena::{Collect, Gc, GcWeak};
@@ -13,8 +12,9 @@ use naga_agal::AgalError;
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::{
     BufferUsage, Context3D, Context3DBlendFactor, Context3DCommand, Context3DCompareMode,
-    Context3DStencilAction, Context3DTextureFormat, Context3DTriangleFace,
-    Context3DVertexBufferFormat, ProgramType, Texture,
+    Context3DMipFilter, Context3DProfile, Context3DStencilAction, Context3DTextureFilter,
+    Context3DTextureFormat, Context3DTriangleFace, Context3DVertexBufferFormat, Context3DWrapMode,
+    IndexBuffer, ProgramType, Texture, VertexBuffer,
 };
 use ruffle_render::commands::CommandHandler;
 use ruffle_render::matrix::Matrix;
@@ -41,6 +41,7 @@ impl<'gc> Context3DObject<'gc> {
         stage3d: Stage3DObject<'gc>,
     ) -> Self {
         let class = context.avm2.classes().context3d;
+        let max_texture_size = context3d.max_texture_size();
 
         Context3DObject(Gc::new(
             context.gc(),
@@ -48,6 +49,10 @@ impl<'gc> Context3DObject<'gc> {
                 base: ScriptObjectData::new(class),
                 render_context: Cell::new(Some(context3d)),
                 stage3d,
+                back_buffer_width: Cell::new(0),
+                back_buffer_height: Cell::new(0),
+                max_back_buffer_width: Cell::new(max_texture_size),
+                max_back_buffer_height: Cell::new(max_texture_size),
             },
         ))
     }
@@ -58,6 +63,14 @@ impl<'gc> Context3DObject<'gc> {
 
     pub fn disposed_texture_handle(self) -> Rc<dyn Texture> {
         self.with_context_3d(|context3d| context3d.disposed_texture_handle())
+    }
+
+    pub fn disposed_index_buffer_handle(self) -> Rc<dyn IndexBuffer> {
+        self.with_context_3d(|context3d| context3d.disposed_index_buffer_handle())
+    }
+
+    pub fn disposed_vertex_buffer_handle(self) -> Rc<dyn VertexBuffer> {
+        self.with_context_3d(|context3d| context3d.disposed_vertex_buffer_handle())
     }
 
     pub fn with_context_3d<R>(self, f: impl FnOnce(&mut dyn Context3D) -> R) -> R {
@@ -78,6 +91,8 @@ impl<'gc> Context3DObject<'gc> {
         wants_best_resolution: bool,
         wants_best_resolution_on_browser_zoom: bool,
     ) {
+        self.0.back_buffer_width.set(width);
+        self.0.back_buffer_height.set(height);
         self.with_context_3d(|ctx| {
             ctx.process_command(Context3DCommand::ConfigureBackBuffer {
                 width,
@@ -88,6 +103,71 @@ impl<'gc> Context3DObject<'gc> {
                 wants_best_resolution_on_browser_zoom,
             })
         });
+    }
+
+    pub fn profile(self) -> Option<Context3DProfile> {
+        let cell = &self.0.render_context;
+        let guard = scopeguard::guard(cell.take(), |stolen| cell.set(stolen));
+        guard.as_deref().map(|context| context.profile())
+    }
+
+    /// Releases the render backend context. Returns the profile so that the
+    /// caller can request a replacement when `dispose(recreate)` asked for one.
+    pub fn dispose(self) -> Option<Context3DProfile> {
+        let profile = self.profile();
+        self.0.render_context.take();
+        profile
+    }
+
+    pub fn driver_info(self) -> String {
+        let cell = &self.0.render_context;
+        let guard = scopeguard::guard(cell.take(), |stolen| cell.set(stolen));
+        guard
+            .as_deref()
+            .map(|context| context.driver_info())
+            .unwrap_or_else(|| "Ruffle (Context3D disposed)".to_owned())
+    }
+
+    pub fn back_buffer_width(self) -> u32 {
+        self.0.back_buffer_width.get()
+    }
+
+    pub fn back_buffer_height(self) -> u32 {
+        self.0.back_buffer_height.get()
+    }
+
+    pub fn set_max_back_buffer_width(self, width: u32) {
+        let device_max = self.device_max_texture_size();
+        self.0.max_back_buffer_width.set(width.clamp(1, device_max));
+    }
+
+    pub fn set_max_back_buffer_height(self, height: u32) {
+        let device_max = self.device_max_texture_size();
+        self.0
+            .max_back_buffer_height
+            .set(height.clamp(1, device_max));
+    }
+
+    fn device_max_texture_size(self) -> u32 {
+        let cell = &self.0.render_context;
+        let mut guard = scopeguard::guard(cell.take(), |stolen| cell.set(stolen));
+        guard
+            .as_deref_mut()
+            .map(|context| context.max_texture_size())
+            .unwrap_or_else(|| {
+                self.0
+                    .max_back_buffer_width
+                    .get()
+                    .max(self.0.max_back_buffer_height.get())
+            })
+    }
+
+    pub fn max_back_buffer_width(self) -> u32 {
+        self.0.max_back_buffer_width.get()
+    }
+
+    pub fn max_back_buffer_height(self) -> u32 {
+        self.0.max_back_buffer_height.get()
     }
 
     pub fn create_index_buffer(
@@ -102,6 +182,7 @@ impl<'gc> Context3DObject<'gc> {
             activation,
             self,
             index_buffer,
+            num_indices,
         ))
     }
 
@@ -116,7 +197,6 @@ impl<'gc> Context3DObject<'gc> {
         class: ClassObject<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        check_texture_stub(activation, format);
         let texture = self.with_context_3d(|ctx| {
             ctx.create_texture(
                 width,
@@ -148,6 +228,7 @@ impl<'gc> Context3DObject<'gc> {
             self,
             handle,
             data_32_per_vertex,
+            num_vertices,
         ))
     }
 
@@ -174,10 +255,10 @@ impl<'gc> Context3DObject<'gc> {
         data: &[u8],
         start_offset: usize,
     ) {
-        let mut handle = buffer.handle();
+        let handle = buffer.handle();
         self.with_context_3d(|ctx| {
             ctx.process_command(Context3DCommand::UploadToIndexBuffer {
-                buffer: &mut *handle,
+                buffer: handle,
                 data,
                 start_offset,
             })
@@ -238,7 +319,7 @@ impl<'gc> Context3DObject<'gc> {
 
         self.with_context_3d(|ctx| {
             ctx.process_command(Context3DCommand::DrawTriangles {
-                index_buffer: &*handle,
+                index_buffer: handle.as_ref(),
                 first_index: first_index as usize,
                 num_triangles: num_triangles as isize,
             })
@@ -350,43 +431,43 @@ impl<'gc> Context3DObject<'gc> {
         source: &BitmapRawData<'gc>,
         dest: Rc<dyn Texture>,
         layer: u32,
+        mip_level: u32,
     ) {
-        // Note - Flash appears to allow a source that's larger than the destination.
-        // Let's leave in this assertion to see if there any real SWFS relying on this
-        // behavior.
-        assert!(
-            source.width() <= dest.width(),
-            "Source width {:?} larger than dest width {:?}",
-            source.width(),
-            dest.width()
-        );
-        assert!(
-            source.height() <= dest.height(),
-            "Source height {:?} larger than dest height {:?}",
-            source.height(),
-            dest.height()
-        );
-
+        // Flash allows a source that's larger than the destination; the
+        // backend clips it to the mip/surface bounds. Never abort the player
+        // on a mismatched upload.
         self.with_context_3d(|ctx| {
             ctx.process_command(Context3DCommand::CopyBitmapToTexture {
                 source: source.pixels_rgba(),
                 source_width: source.width(),
                 source_height: source.height(),
+                source_is_rgba8: true,
                 dest,
                 layer,
+                mip_level,
             })
         });
     }
 
     #[cfg_attr(not(feature = "jpegxr"), allow(unused))]
-    pub(crate) fn copy_pixels_to_texture(self, source: Vec<u8>, dest: Rc<dyn Texture>, layer: u32) {
+    pub(crate) fn copy_pixels_to_texture(
+        self,
+        source: Vec<u8>,
+        dest: Rc<dyn Texture>,
+        layer: u32,
+        mip_level: u32,
+    ) {
+        let source_width = (dest.width() >> mip_level).max(1);
+        let source_height = (dest.height() >> mip_level).max(1);
         self.with_context_3d(|ctx| {
             ctx.process_command(Context3DCommand::CopyBitmapToTexture {
                 source: &source,
-                source_width: dest.width(),
-                source_height: dest.height(),
+                source_width,
+                source_height,
+                source_is_rgba8: false,
                 dest,
                 layer,
+                mip_level,
             })
         });
     }
@@ -429,7 +510,6 @@ impl<'gc> Context3DObject<'gc> {
         streaming_levels: u32,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        check_texture_stub(activation, format);
         let texture = self.with_context_3d(|ctx| {
             ctx.create_cube_texture(
                 size,
@@ -449,14 +529,16 @@ impl<'gc> Context3DObject<'gc> {
     pub(crate) fn set_sampler_state_at(
         self,
         sampler: u32,
-        wrap: ruffle_render::backend::Context3DWrapMode,
-        filter: ruffle_render::backend::Context3DTextureFilter,
+        wrap: Context3DWrapMode,
+        filter: Context3DTextureFilter,
+        mip_filter: Context3DMipFilter,
     ) {
         self.with_context_3d(|ctx| {
             ctx.process_command(Context3DCommand::SetSamplerStateAt {
                 sampler,
                 wrap,
                 filter,
+                mip_filter,
             })
         });
     }
@@ -513,6 +595,11 @@ pub struct Context3DData<'gc> {
     render_context: Cell<Option<Box<dyn Context3D>>>,
 
     stage3d: Stage3DObject<'gc>,
+
+    back_buffer_width: Cell<u32>,
+    back_buffer_height: Cell<u32>,
+    max_back_buffer_width: Cell<u32>,
+    max_back_buffer_height: Cell<u32>,
 }
 
 impl<'gc> TObject<'gc> for Context3DObject<'gc> {
@@ -524,29 +611,5 @@ impl<'gc> TObject<'gc> for Context3DObject<'gc> {
 impl std::fmt::Debug for Context3DObject<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Context3D")
-    }
-}
-
-// This would ideally be placed closer to the actual usage, but
-// we don't have stub support in 'render' crates
-fn check_texture_stub(activation: &mut Activation<'_, '_>, format: Context3DTextureFormat) {
-    match format {
-        Context3DTextureFormat::BgrPacked => {
-            avm2_stub_method!(
-                activation,
-                "flash.display3D.Context3D",
-                "createTexture",
-                "with BgrPacked"
-            );
-        }
-        Context3DTextureFormat::Compressed => {
-            avm2_stub_method!(
-                activation,
-                "flash.display3D.Context3D",
-                "createTexture",
-                "with Compressed"
-            );
-        }
-        _ => {}
     }
 }
